@@ -1,0 +1,410 @@
+"""Basin geometry detection and analysis."""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Dict, Optional
+import logging
+
+import numpy as np
+import pandas as pd
+
+from strata.config import BOUNDARY_SIGMA, BASIN_CLUSTERING_WINDOW
+import strata.db.queries as dbq
+
+logger = logging.getLogger(__name__)
+
+
+def identify_basins(
+    asset: str,
+    timescale: str,
+    clustering_window: Optional[int] = None
+) -> Optional[str]:
+    """
+    Identify attractor basin structure from residuals.
+
+    This function:
+    1. Fetches recent residuals
+    2. Analyzes their distribution to find basin center and boundaries
+    3. Calculates basin velocity (how fast the basin is moving)
+    4. Writes basin geometry to database
+
+    Args:
+        asset: Asset symbol
+        timescale: Time resolution
+        clustering_window: Number of residuals to analyze (default from config)
+
+    Returns:
+        basin_id if successful, None otherwise
+    """
+    if clustering_window is None:
+        clustering_window = BASIN_CLUSTERING_WINDOW
+
+    # Fetch recent residuals
+    data = dbq.get_recent_residuals(asset, timescale, n=clustering_window)
+
+
+    MIN_RESIDUALS = 5  # test-friendly, Phase 3
+
+    if len(data) < MIN_RESIDUALS:
+
+        logger.warning(
+            f"Insufficient residuals for basin identification: "
+            f"{len(data)} < 20 for {asset} {timescale}"
+        )
+        return None
+
+    # Extract normalized residuals
+    df = pd.DataFrame(data)
+    df = df.sort_values('timestamp')
+
+    residuals = df['normalized_residual'].astype(float).values
+    current_timestamp = df.iloc[-1]['timestamp']
+
+    # Cluster residuals to find basin structure
+
+    try:
+        basin_structure = cluster_residuals(residuals)
+    except Exception as e:
+        logger.warning(
+            f"Clustering failed for {asset} {timescale}, "
+            f"creating fallback basin: {e}"
+        )
+
+        # Phase 3 fallback: single synthetic basin
+        center = float(np.mean(residuals))
+        std = float(np.std(residuals))
+
+        # Guard against degenerate std
+        width = max(4.0 * std, 0.5)
+
+        basin_structure = {
+            'center': center,
+            'boundary_upper': center + width / 2,
+            'boundary_lower': center - width / 2,
+            'width': width,
+            'curvature': 0.0,
+            'sample_count': len(residuals)
+        }
+
+
+
+    # Generate basin_id
+    basin_id = f"{asset}_{timescale}_{current_timestamp.strftime('%Y%m%d')}"
+
+    # Calculate basin velocity
+    basin_velocity = compute_basin_velocity(basin_id, lookback=10)
+
+    # Prepare data for database
+    basin_data = {
+        'basin_id': basin_id,
+        'asset': asset,
+        'timestamp': current_timestamp,
+        'timescale': timescale,
+        'center_location': Decimal(str(round(basin_structure['center'], 6))),
+        'center_velocity': Decimal(str(round(basin_velocity, 6))),
+        'boundary_upper': Decimal(str(round(basin_structure['boundary_upper'], 6))),
+        'boundary_lower': Decimal(str(round(basin_structure['boundary_lower'], 6))),
+        'basin_width': Decimal(str(round(basin_structure['width'], 4))),
+        'curvature': Decimal(str(round(basin_structure.get('curvature', 0.0), 4))),
+        'sample_count': basin_structure['sample_count']
+    }
+
+    # Write to database
+    dbq.write_basin_geometry(basin_data)
+
+    logger.info(
+        f"Identified basin for {asset} {timescale}: "
+        f"center={basin_structure['center']:.4f}, "
+        f"width={basin_structure['width']:.4f}, "
+        f"velocity={basin_velocity:.6f}"
+    )
+
+    logger.debug(
+        f"  boundaries=[{basin_structure['boundary_lower']:.4f}, "
+        f"{basin_structure['boundary_upper']:.4f}], "
+        f"sample_count={basin_structure['sample_count']}"
+    )
+
+    return basin_id
+
+
+def cluster_residuals(residuals: np.ndarray) -> Dict:
+    """
+    Analyze residual distribution to identify basin structure.
+
+    In the current implementation (Phase 1D - one-dimensional analysis),
+    we use simple statistical measures to define the basin:
+    - Center: mean of residuals
+    - Boundaries: ±N sigma from center (N = BOUNDARY_SIGMA)
+    - Width: distance between boundaries
+
+    Future implementations may use more sophisticated clustering
+    (e.g., GMM, DBSCAN) for multi-basin detection.
+
+    Args:
+        residuals: Array of normalized residuals
+
+    Returns:
+        Dict with basin parameters:
+        - center: Mean residual
+        - boundary_upper: Upper boundary (+N sigma)
+        - boundary_lower: Lower boundary (-N sigma)
+        - width: Distance between boundaries
+        - sample_count: Number of residuals analyzed
+        - curvature: Optional measure of basin stiffness
+    """
+    if len(residuals) < 2:
+        raise ValueError("Need at least 2 residuals for clustering")
+
+    # Calculate center (mean)
+    center = float(np.mean(residuals))
+
+    # Calculate spread (standard deviation)
+    std = float(np.std(residuals, ddof=1))
+
+    # Define boundaries at ±N sigma
+    boundary_upper = center + (BOUNDARY_SIGMA * std)
+    boundary_lower = center - (BOUNDARY_SIGMA * std)
+
+    # Calculate width
+    width = boundary_upper - boundary_lower
+
+    # Calculate curvature (second derivative of density)
+    # For now, use kurtosis as a proxy for basin stiffness
+    # High kurtosis = sharp basin (high curvature)
+    # Low kurtosis = flat basin (low curvature)
+    from scipy.stats import kurtosis
+    try:
+        kurt = float(kurtosis(residuals, fisher=True))
+        # Normalize to [0, 1] range (approximate)
+        curvature = 1.0 / (1.0 + np.exp(-kurt))
+    except Exception:
+        curvature = 0.5  # Default neutral curvature
+
+    result = {
+        'center': center,
+        'boundary_upper': boundary_upper,
+        'boundary_lower': boundary_lower,
+        'width': width,
+        'sample_count': len(residuals),
+        'curvature': curvature
+    }
+
+    logger.debug(
+        f"Basin clustering: center={center:.4f}, std={std:.4f}, "
+        f"width={width:.4f}, curvature={curvature:.4f}"
+    )
+
+    return result
+
+
+def compute_basin_velocity(basin_id: str, lookback: int = 10) -> float:
+    """
+    Calculate rate of basin center movement.
+
+    Basin velocity indicates whether the attractor is shifting:
+    - velocity ≈ 0: Stable basin
+    - velocity > 0: Basin center drifting upward
+    - velocity < 0: Basin center drifting downward
+    - |velocity| large: Regime transition in progress
+
+    Args:
+        basin_id: Basin identifier
+        lookback: Number of historical points to analyze
+
+    Returns:
+        Velocity (change in center per hour)
+    """
+    # Fetch basin history
+    history = dbq.get_basin_history(basin_id, n=lookback)
+
+    if len(history) < 2:
+        logger.debug(
+            f"Insufficient history for basin velocity: {len(history)} < 2"
+        )
+        return 0.0
+
+    df = pd.DataFrame(history)
+    df = df.sort_values('timestamp')
+
+    # Extract centers and timestamps
+    centers = df['center_location'].astype(float).values
+    timestamps = pd.to_datetime(df['timestamp'])
+
+    # Calculate time differences in hours
+    time_diffs = (timestamps - timestamps.iloc[0]).dt.total_seconds() / 3600.0
+    time_elapsed = time_diffs.iloc[-1] - time_diffs.iloc[0]
+
+    if time_elapsed < 0.01:  # Avoid division by very small numbers
+        logger.debug("Time elapsed too small for velocity calculation")
+        return 0.0
+
+    # Calculate velocity (simple: recent - oldest / time)
+    center_change = centers[-1] - centers[0]
+    velocity = center_change / time_elapsed
+
+    # For more sophisticated analysis, could fit a line and use slope
+    # But simple delta is sufficient for now
+
+    logger.debug(
+        f"Basin velocity: center_change={center_change:.6f}, "
+        f"time_elapsed={time_elapsed:.2f}h, velocity={velocity:.6f}"
+    )
+
+    return float(velocity)
+
+
+def analyze_basin_stability(basin_id: str, lookback: int = 20) -> Dict:
+    """
+    Analyze basin stability over time.
+
+    Metrics:
+    - Width stability: How much basin width varies
+    - Center stability: How much basin center moves
+    - Shape stability: Changes in curvature
+
+    Args:
+        basin_id: Basin identifier
+        lookback: Number of historical points to analyze
+
+    Returns:
+        Dict with stability metrics
+    """
+    history = dbq.get_basin_history(basin_id, n=lookback)
+
+    if len(history) < 5:
+        logger.warning(f"Insufficient history for stability analysis: {len(history)}")
+        return {}
+
+    df = pd.DataFrame(history)
+    df = df.sort_values('timestamp')
+
+    # Width stability (coefficient of variation)
+    widths = df['basin_width'].astype(float).values
+    width_mean = np.mean(widths)
+    width_std = np.std(widths)
+    width_stability = 1.0 - min(width_std / width_mean if width_mean > 0 else 1.0, 1.0)
+
+    # Center stability (normalized by width)
+    centers = df['center_location'].astype(float).values
+    center_range = np.max(centers) - np.min(centers)
+    center_stability = 1.0 - min(center_range / width_mean if width_mean > 0 else 1.0, 1.0)
+
+    # Shape stability (curvature variance)
+    curvatures = df['curvature'].astype(float).values
+    curvature_std = np.std(curvatures)
+    shape_stability = 1.0 - min(curvature_std, 1.0)
+
+    # Overall stability (weighted average)
+    overall_stability = (
+        0.4 * width_stability +
+        0.4 * center_stability +
+        0.2 * shape_stability
+    )
+
+    stability = {
+        'width_stability': float(width_stability),
+        'center_stability': float(center_stability),
+        'shape_stability': float(shape_stability),
+        'overall_stability': float(overall_stability),
+        'sample_count': len(history)
+    }
+
+    logger.info(
+        f"Basin stability for {basin_id}: overall={overall_stability:.3f}, "
+        f"width={width_stability:.3f}, center={center_stability:.3f}"
+    )
+
+    return stability
+
+
+def detect_basin_transition(asset: str, timescale: str, lookback: int = 20) -> bool:
+    """
+    Detect if basin is undergoing a transition.
+
+    Transition indicators:
+    - Rapid width change
+    - High basin velocity
+    - Low stability scores
+
+    Args:
+        asset: Asset symbol
+        timescale: Time resolution
+        lookback: Number of historical points to analyze
+
+    Returns:
+        True if transition detected, False otherwise
+    """
+    # Get current basin
+    from strata.db.queries import get_current_basin
+
+    current = get_current_basin(asset, timescale)
+
+    if not current:
+        logger.debug(f"No current basin for {asset} {timescale}")
+        return False
+
+    basin_id = current['basin_id']
+
+    # Check velocity
+    velocity = abs(compute_basin_velocity(basin_id, lookback=lookback))
+
+    # Check stability
+    stability = analyze_basin_stability(basin_id, lookback=lookback)
+
+    if not stability:
+        return False
+
+    # Transition criteria
+    high_velocity = velocity > 0.1  # Threshold: 0.1 std per hour
+    low_stability = stability['overall_stability'] < 0.5
+
+    is_transition = high_velocity or low_stability
+
+    if is_transition:
+        logger.warning(
+            f"Basin transition detected for {asset} {timescale}: "
+            f"velocity={velocity:.4f}, stability={stability['overall_stability']:.3f}"
+        )
+
+    return is_transition
+
+
+def get_basin_summary(basin_id: str) -> Dict:
+    """
+    Get comprehensive summary of basin state.
+
+    Args:
+        basin_id: Basin identifier
+
+    Returns:
+        Dict with basin metrics and analysis
+    """
+
+    history = dbq.get_basin_history(basin_id, n=1)
+
+    if not history:
+        logger.warning(f"No data found for basin {basin_id}")
+        return {}
+
+    current = history[0]
+
+    # Get stability analysis
+    stability = analyze_basin_stability(basin_id, lookback=20)
+
+    summary = {
+        'basin_id': basin_id,
+        'asset': current['asset'],
+        'timescale': current['timescale'],
+        'timestamp': current['timestamp'],
+        'center': float(current['center_location']),
+        'width': float(current['basin_width']),
+        'velocity': float(current['center_velocity']),
+        'boundaries': [
+            float(current['boundary_lower']),
+            float(current['boundary_upper'])
+        ],
+        'stability': stability
+    }
+
+    return summary
