@@ -186,13 +186,14 @@ class MockMarketDataIngester:
             seed: Random seed for reproducibility
         """
         self.seed = seed if seed is not None else MOCK_DATA_SEED
-        random.seed(self.seed)
-        np.random.seed(self.seed)
+        self._rng = random.Random(self.seed)
+        self._np_rng = np.random.default_rng(self.seed)
+
 
         # Track state for random walk
         self._drift = {asset: 0.0 for asset in self.BASE_PRICES}
         self._last_timestamp = {}
-
+        self._step = {}
         logger.info(f"MockMarketDataIngester initialized with seed={self.seed}")
 
     def connect(self) -> None:
@@ -243,7 +244,7 @@ class MockMarketDataIngester:
             'timescale': timescale,
             'price': Decimal(str(round(price, 2))),
             'implied_vol': Decimal(str(round(vol, 6))),
-            'skew': Decimal(str(round(random.uniform(-0.05, 0.05), 6))),
+            'skew': Decimal(str(round(self._rng.uniform(-0.05, 0.05), 6))),
             'volume': volume,
             'bid_ask_spread': Decimal(str(round(bid_ask_spread, 4)))
         }
@@ -255,6 +256,7 @@ class MockMarketDataIngester:
         )
 
 
+
     def _generate_price(
         self,
         asset: str,
@@ -262,21 +264,21 @@ class MockMarketDataIngester:
         vol: float,
         timestamp: datetime
     ) -> float:
-        """
-        Generate realistic price using sine wave + random walk + noise.
-        """
 
-        # Convert timestamp to time index (hours since epoch)
-        t = timestamp.timestamp() / 3600.0
+        # Initialize step counter
+        if asset not in self._step:
+            self._step[asset] = 0
 
-        # Sine wave component (30-day cycle)
-        period = 30 * 24  # 30 days in hours
-        sine_component = math.sin(2 * math.pi * t / period) * 0.05
+        step = self._step[asset]
+        self._step[asset] += 1
 
-        # Random walk drift
-        drift_change = np.random.normal(0, vol / 10)
+        # Synthetic time (deterministic)
+        period = 30
+        sine_component = math.sin(2 * math.pi * step / period) * 0.05
 
-        # Lazy-init drift for unknown assets
+        # Random walk drift (seeded)
+        drift_change = self._np_rng.normal(0, vol / 10)
+
         if asset not in self._drift:
             self._drift[asset] = 0.0
 
@@ -285,18 +287,22 @@ class MockMarketDataIngester:
             -0.2
         )
 
-        # Noise component
-        noise = np.random.normal(0, vol / 2)
+        noise = self._np_rng.normal(0, vol / 2)
 
-        # Final price
-        price = base_price * (
-            1
-            + sine_component
-            + self._drift[asset]
-            + noise
-        )
+        price = base_price * (1 + sine_component + self._drift[asset] + noise)
 
         return max(price, 0.01)
+
+    def _generate_price_at_step(self, asset, base_price, vol, step):
+        period = 30
+        sine_component = math.sin(2 * math.pi * step / period) * 0.05
+
+        drift = self._drift.get(asset, 0.0)
+        noise = self._np_rng.normal(0, vol / 2)
+
+        return max(base_price * (1 + sine_component + drift + noise), 0.01)
+
+
 
     def _generate_volume(self, asset: str) -> int:
         """
@@ -320,28 +326,30 @@ class MockMarketDataIngester:
         base = base_volumes.get(asset, 1_000_000)
 
         # Add randomness (±30%)
-        multiplier = random.uniform(0.7, 1.3)
+        
+        multiplier = self._rng.uniform(0.7, 1.3)
+
 
         return int(base * multiplier)
 
+
     def fetch_latest_price(self, asset: str) -> Optional[Decimal]:
-        """
-        Get synthetic current price.
-
-        Args:
-            asset: Asset symbol
-
-        Returns:
-            Synthetic price
-        """
         if asset not in self.BASE_PRICES:
             return None
 
         base_price = self.BASE_PRICES[asset]
         vol = self.VOLATILITY[asset]
-        price = self._generate_price(asset, base_price, vol, datetime.now())
+
+        # Snapshot step instead of advancing
+        step = self._step.get(asset, 0)
+
+        price = self._generate_price_at_step(
+            asset, base_price, vol, step
+        )
 
         return Decimal(str(round(price, 2)))
+
+
 
     def fetch_volatility_surface(self, asset: str) -> Dict:
         """
@@ -356,7 +364,7 @@ class MockMarketDataIngester:
         vol = self.VOLATILITY.get(asset, 0.02)
         return {
             'implied_vol': Decimal(str(vol)),
-            'skew': Decimal(str(round(random.uniform(-0.05, 0.05), 6)))
+            'skew': Decimal(str(round(self._rng.uniform(-0.05, 0.05), 6)))
         }
 
 
@@ -436,3 +444,5 @@ def generate_historical_data(
         ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
 
     logger.info(f"Generated {n_periods} historical data points for {asset}")
+
+

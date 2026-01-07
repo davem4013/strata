@@ -241,9 +241,13 @@ def analyze_residual_statistics(asset: str, timescale: str) -> dict:
 
     data = get_recent_residuals(asset, timescale, n=100)
 
+
+
     if len(data) < 10:
         logger.warning(f"Insufficient residual data for statistics: {len(data)}")
-        return {}
+        return None
+
+
 
     df = pd.DataFrame(data)
     df = df.sort_values('timestamp')

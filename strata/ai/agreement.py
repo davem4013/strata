@@ -19,6 +19,7 @@ from strata.db.queries import (
     write_agreement_metrics
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -210,59 +211,37 @@ def calculate_variance_metrics(interpretations: pd.DataFrame) -> Dict[str, float
     }
 
 
-def calculate_directional_divergence(interpretations: pd.DataFrame) -> float:
+def calculate_directional_divergence(
+    interpretations: pd.DataFrame,
+    basin_center: float
+) -> float:
     """
-    Measure if models disagree in same direction or opposing directions.
+    Binary directional disagreement metric.
 
-    This is critical: models can all disagree (high variance) but in the
-    same direction (e.g., all think basin is shifting up). That's different
-    from models predicting opposing directions (some up, some down).
-
-    Opposing directions = chaotic regime, very high uncertainty.
-
-    Args:
-        interpretations: DataFrame with 'center_estimate' column
-
-    Returns:
-        float: 0.0 = same direction, 1.0 = opposing directions
-
-    Implementation:
-        1. Calculate mean center estimate
-        2. Calculate signed deviations from mean for each model
-        3. If all deviations same sign -> low divergence (0.0)
-        4. If deviations split evenly -> high divergence (1.0)
-        5. Use metric: 1 - abs(mean(sign(deviations)))
+    0.0 = all models point same direction relative to basin center
+    1.0 = models disagree on direction
     """
-    centers = interpretations['center_estimate'].astype(float)
+
+    centers = interpretations['center_estimate'].astype(float).values
 
     if len(centers) < 2:
         return 0.0
 
-    # Calculate deviations from mean
-    mean_center = centers.mean()
-    deviations = centers - mean_center
+    # Direction relative to basin center
+    directions = np.sign(centers - basin_center)
 
-    # Avoid division by zero
-    if np.std(deviations) < 1e-6:
-        logger.debug("Deviations too small, directional divergence = 0")
+    # Remove zero entries (exactly at center)
+    directions = directions[directions != 0]
+
+    if len(directions) == 0:
         return 0.0
 
-    # Calculate signs
-    signs = np.sign(deviations)
+    # If more than one unique sign → disagreement
+    return 0.0 if np.all(directions == directions[0]) else 1.0
 
-    # Sign balance: 1.0 = all same sign, 0.0 = perfectly balanced
-    sign_balance = abs(np.mean(signs))
 
-    # Directional divergence: inverse of sign balance
-    directional_divergence = 1.0 - sign_balance
 
-    logger.debug(
-        f"Directional divergence: {directional_divergence:.3f} "
-        f"(sign_balance={sign_balance:.3f}, "
-        f"signs={signs.tolist()})"
-    )
 
-    return float(directional_divergence)
 
 
 def compute_agreement_score(

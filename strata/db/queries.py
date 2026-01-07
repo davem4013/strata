@@ -3,7 +3,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional
 import logging
-
+import json
+import numpy as np
 from strata.db.connection import get_cursor
 
 logger = logging.getLogger(__name__)
@@ -284,6 +285,7 @@ def get_basin_position_current(asset: str, timescale: str) -> Optional[Dict]:
         return cursor.fetchone()
 
 
+
 def get_model_interpretations(basin_id: str, timestamp: datetime) -> List[Dict]:
     """Get all model interpretations for a basin at timestamp."""
     query = """
@@ -292,21 +294,37 @@ def get_model_interpretations(basin_id: str, timestamp: datetime) -> List[Dict]:
     """
     with get_cursor() as cursor:
         cursor.execute(query, (basin_id, timestamp))
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+
+    # 🔧 FIX: deserialize embeddings from JSON/text → np.ndarray
+    for row in rows:
+        embedding = row.get("embedding")
+        if isinstance(embedding, str):
+            row["embedding"] = np.array(
+                json.loads(embedding),
+                dtype=float
+            )
+
+    return rows
+
 
 
 def get_agreement_metrics_current(asset: str, timescale: str) -> Optional[Dict]:
     """Get most recent agreement metrics."""
     query = """
-        SELECT am.* FROM agreement_metrics am
-        JOIN basin_geometry bg ON am.basin_id = bg.basin_id AND am.timestamp = bg.timestamp
-        WHERE bg.asset = %s AND bg.timescale = %s
+        SELECT am.*
+        FROM agreement_metrics am
+        JOIN basin_geometry bg
+          ON am.basin_id = bg.basin_id
+        WHERE bg.asset = %s
+          AND bg.timescale = %s
         ORDER BY am.timestamp DESC
         LIMIT 1;
     """
     with get_cursor() as cursor:
         cursor.execute(query, (asset, timescale))
         return cursor.fetchone()
+
 
 
 def get_active_cascades(lookback_hours: int = 24) -> List[Dict]:

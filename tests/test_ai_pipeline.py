@@ -23,7 +23,7 @@ from strata.analysis.position import compute_basin_position
 from strata.ai.model_analysis import ModelAnalyzer
 from strata.ai.agreement import compute_agreement, calculate_semantic_distance
 from strata.events.detection import detect_regime_events, summarize_events
-
+from strata.analysis.residuals import compute_residuals_bulk
 # Setup logging
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ def test_model_analysis(db_connection):
     # Compute residuals
     logger.info("[2/5] Computing residuals...")
     for i in range(20, 50):
-        compute_residuals(asset, timescale)
+        compute_residuals_bulk(asset, timescale, n_periods=30)
 
     # Identify basin
     logger.info("[3/5] Identifying basin...")
@@ -122,7 +122,10 @@ def test_agreement_calculation(db_connection):
         ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
 
     for i in range(20, 50):
-        compute_residuals(asset, timescale)
+        compute_residuals_bulk(asset, timescale, n_periods=30)
+
+    for i in range(20, 50):
+        compute_residuals_bulk(asset, timescale, n_periods=30)
 
     basin_id = identify_basins(asset, timescale)
     compute_basin_position(asset, timescale)
@@ -219,7 +222,7 @@ def test_event_detection(db_connection):
         ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
 
     for i in range(20, 50):
-        compute_residuals(asset, timescale)
+        compute_residuals_bulk(asset, timescale, n_periods=30)
 
     basin_id = identify_basins(asset, timescale)
     compute_basin_position(asset, timescale)
