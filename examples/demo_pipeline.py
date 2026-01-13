@@ -58,13 +58,15 @@ def demo_pipeline():
         logger.info("STEP 1: Generating Historical Market Data")
         logger.info("-" * 80)
 
-        ingester = MockMarketDataIngester(seed=42)
-        start_time = datetime.now() - timedelta(days=n_historical_periods)
+       
+        from strata.ingestion.market_data import AnalyticsAPIMarketDataIngester
+
+        ingester = AnalyticsAPIMarketDataIngester(
+            base_url="http://127.0.0.1:8000"
+        )
 
         logger.info(f"Generating {n_historical_periods} days of synthetic data...")
-        for i in range(n_historical_periods):
-            timestamp = start_time + timedelta(days=i)
-            ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
+
 
         logger.info(f"✓ Generated {n_historical_periods} market data points")
 

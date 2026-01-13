@@ -79,7 +79,21 @@ def compute_agreement(basin_id: str, timestamp: datetime) -> Optional[Decimal]:
     variance_boundary = variance_metrics['variance_boundary']
 
     # Calculate directional divergence
-    directional_divergence = calculate_directional_divergence(df)
+        
+    from strata.analysis.basins import get_basin_summary
+
+    basin_summary = get_basin_summary(basin_id)
+
+    if not basin_summary:
+        raise ValueError(f"No basin summary available for basin {basin_id}")
+
+    basin_center = basin_summary["center"]
+
+    directional_divergence = calculate_directional_divergence(
+        df,
+        basin_center
+    )
+
 
     # Calculate overall agreement score
     agreement_score = compute_agreement_score(
@@ -211,37 +225,52 @@ def calculate_variance_metrics(interpretations: pd.DataFrame) -> Dict[str, float
     }
 
 
+
 def calculate_directional_divergence(
-    interpretations: pd.DataFrame,
-    basin_center: float
+    df: pd.DataFrame,
+    basin_center: float | None = None
 ) -> float:
     """
-    Binary directional disagreement metric.
+    Directional divergence = epistemic conflict score.
 
-    0.0 = all models point same direction relative to basin center
-    1.0 = models disagree on direction
+    0.0 → full agreement
+    1.0 → perfectly balanced split
     """
 
-    centers = interpretations['center_estimate'].astype(float).values
-
-    if len(centers) < 2:
+    if df.empty:
         return 0.0
 
-    # Direction relative to basin center
-    directions = np.sign(centers - basin_center)
+    if "center_estimate" not in df.columns:
+        raise ValueError(
+            f"Expected 'center_estimate' column, got {df.columns.tolist()}"
+        )
 
-    # Remove zero entries (exactly at center)
+    centers = df["center_estimate"].astype(float)
+
+
+    if basin_center is None:
+        # Test mode: assume zero-centered equilibrium
+        reference = 0.0
+    else:
+        reference = basin_center
+
+
+    # Direction only: -1 / +1
+    directions = np.sign(centers - reference)
+
+    # Remove exact-zero entries (perfectly on center)
     directions = directions[directions != 0]
 
     if len(directions) == 0:
         return 0.0
 
-    # If more than one unique sign → disagreement
-    return 0.0 if np.all(directions == directions[0]) else 1.0
+    # Agreement = magnitude of mean direction
+    agreement = abs(directions.mean())
 
+    # Divergence = lack of agreement
+    divergence = 1.0 - agreement
 
-
-
+    return float(divergence)
 
 
 def compute_agreement_score(

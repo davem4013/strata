@@ -11,8 +11,10 @@ from strata.db.queries import (
     get_basin_position_current,
     get_agreement_metrics_current,
     write_regime_event,
-    get_active_alerts as db_get_active_alerts
+    get_active_alerts as db_get_active_alerts,
+    get_system_state
 )
+from strata.analysis.vol_spine import analyze_spine_field
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,13 @@ def detect_regime_events(
 
     # Get basin history
     basin_history = get_basin_history(basin_id, n=5)
+
+    # Pull forward volatility spine state (if available)
+    spine_state = get_system_state(f"forward_vol_spine:{asset}:{timescale}")
+    spine_metrics = None
+    if spine_state:
+        residual_field = spine_state.get('residual_field') or spine_state.get('spine', [])
+        spine_metrics = analyze_spine_field(residual_field)
 
     # Collect detected events
     events = []
@@ -157,6 +166,73 @@ def detect_regime_events(
             logger.error(
                 f"Basin collapse detected for {asset}: "
                 f"width change={width_change_rate:.1%}"
+            )
+
+    # Check 6: Forward volatility spine stress
+    if spine_metrics:
+        curvature_threshold = 0.08
+        detachment_threshold = 0.05
+        front_jump_threshold = 0.07
+
+        if spine_metrics['max_abs_curvature'] > curvature_threshold:
+            severity = min(
+                spine_metrics['max_abs_curvature'] / curvature_threshold,
+                1.0
+            )
+            events.append({
+                'event_type': 'spine_curvature_spike',
+                'severity': severity,
+                'source': 'vol_spine',
+                'metadata': {
+                    'max_abs_curvature': spine_metrics['max_abs_curvature'],
+                    'shape': spine_metrics['shape']
+                }
+            })
+            logger.warning(
+                "Spine curvature spike for %s: curvature=%.4f shape=%s",
+                asset,
+                spine_metrics['max_abs_curvature'],
+                spine_metrics['shape']
+            )
+
+        if spine_metrics['max_abs_residual'] > detachment_threshold:
+            severity = min(
+                spine_metrics['max_abs_residual'] / detachment_threshold,
+                1.0
+            )
+            events.append({
+                'event_type': 'spine_detachment',
+                'severity': severity,
+                'source': 'vol_spine',
+                'metadata': {
+                    'max_abs_residual': spine_metrics['max_abs_residual'],
+                    'shape': spine_metrics['shape']
+                }
+            })
+            logger.error(
+                "Vol spine detached from surface for %s: residual=%.4f",
+                asset,
+                spine_metrics['max_abs_residual']
+            )
+
+        if abs(spine_metrics['front_residual']) > front_jump_threshold:
+            severity = min(
+                abs(spine_metrics['front_residual']) / front_jump_threshold,
+                1.0
+            )
+            events.append({
+                'event_type': 'front_residual_jump',
+                'severity': severity,
+                'source': 'vol_spine',
+                'metadata': {
+                    'front_residual': spine_metrics['front_residual'],
+                    'shape': spine_metrics['shape']
+                }
+            })
+            logger.warning(
+                "Front-month residual jump for %s: residual=%.4f",
+                asset,
+                spine_metrics['front_residual']
             )
 
     # Write events to database
@@ -425,6 +501,31 @@ def generate_alert_message(event: Dict) -> str:
             f"BASIN COLLAPSE for {asset}: "
             f"Basin width shrinking rapidly ({width_change:.1%}). "
             f"Recommendation: EXIT POSITIONS."
+        )
+
+    elif event_type == 'spine_curvature_spike':
+        curvature = metadata.get('max_abs_curvature', 'N/A')
+        shape = metadata.get('shape', 'flat')
+        msg = (
+            f"VOL SPINE CURVATURE SPIKE for {asset}: "
+            f"Shape={shape}, curvature={curvature:.3f}. "
+            f"Recommendation: TIGHTEN RISK, watch for event stress."
+        )
+
+    elif event_type == 'spine_detachment':
+        detachment = metadata.get('max_abs_residual', 'N/A')
+        msg = (
+            f"VOL SPINE DETACHMENT for {asset}: "
+            f"Residual={detachment:.3f} (ATM demand vs surface). "
+            f"Recommendation: HEDGE FORWARD VOL RISK."
+        )
+
+    elif event_type == 'front_residual_jump':
+        residual = metadata.get('front_residual', 'N/A')
+        msg = (
+            f"FRONT-MONTH VOL JUMP for {asset}: "
+            f"Residual={residual:.3f}. "
+            f"Recommendation: EXPECT NEAR-TERM SHOCKS."
         )
 
     else:

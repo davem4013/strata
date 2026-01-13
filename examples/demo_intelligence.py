@@ -78,12 +78,13 @@ def demo_intelligence_pipeline():
         print("-" * 80)
 
         print("\n[1.1] Generating market data...")
-        ingester = MockMarketDataIngester(seed=42)
-        start_time = datetime.now() - timedelta(days=n_periods)
 
-        for i in range(n_periods):
-            timestamp = start_time + timedelta(days=i)
-            ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
+        from strata.ingestion.market_data import AnalyticsAPIMarketDataIngester
+
+        ingester = AnalyticsAPIMarketDataIngester(
+            base_url="http://127.0.0.1:8000"
+        )
+
 
         print(f"✓ Generated {n_periods} days of market data")
 

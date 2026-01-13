@@ -1,0 +1,8 @@
+numpy
+pytest
+dotenv
+psycopg2
+ib_insync
+pandas
+scikit-learn
+sentence_transformers

@@ -1,16 +1,96 @@
 """Market data ingestion from IBKR API and mock data generation."""
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import logging
 import random
 import math
-
-from ib_insync import IB, Stock
+import requests
 import numpy as np
+from ib_insync import IB, Stock
 
+from strata.analysis.vol_spine import (
+    analyze_spine_field,
+    build_forward_vol_spine,
+    extract_residual_field,
+    serialize_spine,
+)
 from strata.config import IBKR_CONFIG, MOCK_IBKR_DATA, MOCK_DATA_SEED
-from strata.db.queries import write_market_state
+from strata.db.queries import write_market_state, write_system_state
+
+class AnalyticsAPIMarketDataIngester:
+    """
+    Ingest market state from Analytics FastAPI service.
+    """
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+        self.base_url = base_url.rstrip("/")
+        logger.info(f"Analytics API ingester using {self.base_url}")
+
+    def connect(self) -> None:
+        # No persistent connection needed
+        logger.info("Analytics API ingester ready")
+
+    def disconnect(self) -> None:
+        logger.info("Analytics API ingester disconnected")
+
+    def ingest_market_data(self, asset: str, timescale: str) -> None:
+        """
+        Pull derived market state from Analytics and store in STRATA DB.
+        """
+
+        try:
+            # 1️⃣ Pull IV / Greeks summary
+            iv_resp = requests.post(
+                f"{self.base_url}/analytics/compute/iv",
+                json={"symbol": asset}
+            )
+            iv_resp.raise_for_status()
+            iv_data = iv_resp.json()
+
+            # 2️⃣ Pull current regime (optional but powerful)
+            regime_resp = requests.get(
+                f"{self.base_url}/regime/current",
+                params={"symbol": asset}
+            )
+            regime_data = regime_resp.json() if regime_resp.ok else {}
+
+            # 3️⃣ Pull underlying price
+            price = iv_data.get("spot")
+            implied_vol = iv_data.get("atm_iv")
+            term_structure = (
+                iv_data.get("forward_vol_spine")
+                or iv_data.get("term_structure")
+                or iv_data.get("atm_term_structure")
+                or []
+            )
+
+            if price is None:
+                logger.warning(f"No price returned for {asset}")
+                return
+
+            data = {
+                "asset": asset,
+                "timestamp": datetime.utcnow(),
+                "timescale": timescale,
+                "price": Decimal(str(price)),
+                "implied_vol": (
+                    Decimal(str(implied_vol)) if implied_vol is not None else None
+                ),
+                "skew": None,  # optional: derive later
+                "volume": None,
+                "bid_ask_spread": None,
+            }
+
+            write_market_state(data)
+
+            logger.info(
+                f"Analytics-ingested {asset}: price={price}, iv={implied_vol}, "
+                f"regime={regime_data.get('regime_type')}"
+            )
+
+        except Exception as e:
+            logger.error(f"Analytics API ingestion failed for {asset}: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -368,39 +448,135 @@ class MockMarketDataIngester:
         }
 
 
+
+# ============================================================================
+# Synthetic Market Data Ingester (for testing without IBKR connection)
+# ============================================================================
+
+
+    """
+    Ingest market state from Analytics FastAPI service.
+    """
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+        self.base_url = base_url.rstrip("/")
+        logger.info(f"Analytics API ingester using {self.base_url}")
+
+    def connect(self) -> None:
+        # No persistent connection needed
+        logger.info("Analytics API ingester ready")
+
+    def disconnect(self) -> None:
+        logger.info("Analytics API ingester disconnected")
+
+    def ingest_market_data(self, asset: str, timescale: str) -> None:
+        """
+        Pull derived market state from Analytics and store in STRATA DB.
+        """
+
+        try:
+            # 1️⃣ Pull IV / Greeks summary
+            iv_resp = requests.post(
+                f"{self.base_url}/analytics/compute/iv",
+                json={"symbol": asset}
+            )
+            iv_resp.raise_for_status()
+            iv_data = iv_resp.json()
+
+            # 2️⃣ Pull current regime (optional but powerful)
+            regime_resp = requests.get(
+                f"{self.base_url}/regime/current",
+                params={"symbol": asset}
+            )
+            regime_data = regime_resp.json() if regime_resp.ok else {}
+
+            # 3️⃣ Pull underlying price
+            price = iv_data.get("spot")
+            implied_vol = iv_data.get("atm_iv")
+
+            if price is None:
+                logger.warning(f"No price returned for {asset}")
+                return
+
+            data = {
+                "asset": asset,
+                "timestamp": datetime.utcnow(),
+                "timescale": timescale,
+                "price": Decimal(str(price)),
+                "implied_vol": (
+                    Decimal(str(implied_vol)) if implied_vol is not None else None
+                ),
+                "skew": None,  # optional: derive later
+                "volume": None,
+                "bid_ask_spread": None,
+            }
+
+            # Build and persist forward volatility spine + residual field
+            if term_structure:
+                try:
+                    spine = build_forward_vol_spine(term_structure)
+                    residual_field = extract_residual_field(spine)
+                    spine_metrics = analyze_spine_field(spine)
+
+                    write_system_state(
+                        f"forward_vol_spine:{asset}:{timescale}",
+                        {
+                            "spine": serialize_spine(spine),
+                            "residual_field": residual_field,
+                            "metrics": spine_metrics,
+                            "as_of": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    logger.debug(
+                        "Updated forward vol spine for %s %s: front_residual=%.4f, "
+                        "curvature=%.4f",
+                        asset,
+                        timescale,
+                        spine_metrics["front_residual"],
+                        spine_metrics["max_abs_curvature"],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to construct forward vol spine for %s: %s",
+                        asset,
+                        exc,
+                    )
+
+            write_market_state(data)
+
+            logger.info(
+                f"Analytics-ingested {asset}: price={price}, iv={implied_vol}, "
+                f"regime={regime_data.get('regime_type')}"
+            )
+
+        except Exception as e:
+            logger.error(f"Analytics API ingestion failed for {asset}: {e}")
+
+
+
 # ============================================================================
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
-def ingest_all_assets(timescale: str, use_mock: Optional[bool] = None) -> None:
-    """
-    Ingest data for all configured assets at given timescale.
-
-    Args:
-        timescale: Time resolution (1h, 4h, 1d, 1w, 1m)
-        use_mock: Use mock data (defaults to MOCK_IBKR_DATA config)
-    """
+def ingest_all_assets(timescale: str, source: str = "mock") -> None:
     from strata.config import ASSETS
 
-    if use_mock is None:
-        use_mock = MOCK_IBKR_DATA
-
-    if use_mock:
+    if source == "mock":
         ingester = MockMarketDataIngester()
-        logger.info(f"Using MockMarketDataIngester for timescale {timescale}")
-    else:
+    elif source == "ibkr":
         ingester = MarketDataIngester()
-        logger.info(f"Using MarketDataIngester for timescale {timescale}")
+    elif source == "analytics":
+        ingester = AnalyticsAPIMarketDataIngester()
+    else:
+        raise ValueError(f"Unknown ingestion source: {source}")
 
     ingester.connect()
-
     try:
         for asset in ASSETS:
             ingester.ingest_market_data(asset, timescale)
     finally:
         ingester.disconnect()
 
-    logger.info(f"Ingested data for {len(ASSETS)} assets at timescale {timescale}")
 
 
 def generate_historical_data(
@@ -444,5 +620,3 @@ def generate_historical_data(
         ingester.ingest_market_data(asset, timescale, timestamp=timestamp)
 
     logger.info(f"Generated {n_periods} historical data points for {asset}")
-
-

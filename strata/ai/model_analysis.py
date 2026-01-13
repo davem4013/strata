@@ -13,8 +13,11 @@ from strata.db.queries import (
     get_current_basin,
     get_recent_residuals,
     get_basin_position_current,
-    write_model_interpretation
+    write_model_interpretation,
+    get_system_state
 )
+from strata.ai.state import MarketState
+from strata.analysis.vol_spine import ForwardVolPoint, analyze_spine_field
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +98,7 @@ class ModelAnalyzer:
         position = get_basin_position_current(asset, timescale)
 
         # Extract context
-        context = self._prepare_context(basin, residuals, position)
+        context = self._prepare_context(basin, residuals, position, asset, timescale)
 
         # Construct prompt
         prompt = self._construct_prompt(asset, timescale, context)
@@ -283,7 +286,9 @@ class ModelAnalyzer:
         self,
         basin: Dict,
         residuals: List[Dict],
-        position: Optional[Dict]
+        position: Optional[Dict],
+        asset: Optional[str] = None,
+        timescale: Optional[str] = None
     ) -> Dict:
         """
         Prepare market state context for model prompt.
@@ -292,6 +297,8 @@ class ModelAnalyzer:
             basin: Basin geometry data
             residuals: Recent residuals
             position: Position data (optional)
+            asset: Asset symbol for spine lookup
+            timescale: Time resolution for spine lookup
 
         Returns:
             Context dict
@@ -320,6 +327,37 @@ class ModelAnalyzer:
                 'lag_score': float(position['lag_score'])
             })
 
+        market_state = MarketState()
+        if asset and timescale:
+            try:
+                spine_state = get_system_state(f"forward_vol_spine:{asset}:{timescale}")
+            except Exception:
+                spine_state = None
+
+            if spine_state:
+                residual_field = spine_state.get('residual_field') or spine_state.get('spine', [])
+                market_state.spine_residuals = residual_field
+                market_state.forward_vol_spine = [
+                    ForwardVolPoint(
+                        expiry=datetime.fromisoformat(p['expiry']),
+                        atm_strike=float(p.get('atm_strike', 0.0)),
+                        atm_iv=float(p.get('atm_iv', 0.0)),
+                        surface_iv=float(p.get('surface_iv', 0.0)),
+                        residual=float(p.get('residual', 0.0))
+                    )
+                    for p in spine_state.get('spine', [])
+                ]
+
+                spine_metrics = analyze_spine_field(residual_field)
+                context.update({
+                    'spine_shape': spine_metrics.get('shape'),
+                    'spine_front_residual': spine_metrics.get('front_residual'),
+                    'spine_curvature': spine_metrics.get('max_abs_curvature'),
+                    'spine_residuals': spine_metrics.get('residuals')
+                })
+
+        context['market_state'] = market_state.to_compact_dict()
+
         return context
 
     def _construct_prompt(self, asset: str, timescale: str, context: Dict) -> str:
@@ -343,6 +381,9 @@ Basin center: {context['center_location']:.4f}
 Basin width: {context['basin_width']:.4f}
 Distance to center: {context.get('distance_to_center', 'N/A')}
 Recent residual trend: {[f"{r:.3f}" for r in context['recent_residuals'][:5]]}
+Spine front residual: {context.get('spine_front_residual', 'N/A')}
+Spine curvature (abs max): {context.get('spine_curvature', 'N/A')}
+Spine shape: {context.get('spine_shape', 'flat')}
 
 Assess:
 1. Regime type: stable/transitional/bifurcating/collapsing
