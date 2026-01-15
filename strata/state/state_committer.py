@@ -41,6 +41,7 @@ class StrataStateCommitter:
         self._last_price: Optional[float] = None
         self._last_timestamp: Optional[float] = None
         self._last_surface: Optional[Dict] = None
+        self._last_surface_ts: Optional[float] = None
         self._last_surface_poll: float = 0.0
 
     def run(self) -> None:
@@ -68,6 +69,10 @@ class StrataStateCommitter:
             surface = self._fetch_surface()
             if surface is not None:
                 self._last_surface = surface
+                surface_ts = surface.get("timestamp") or surface.get("surface_timestamp")
+                self._last_surface_ts = (
+                    self._to_timestamp(surface_ts) if surface_ts is not None else self._last_surface_ts
+                )
             self._last_surface_poll = now
 
         price_tick = self._fetch_price()
@@ -77,12 +82,15 @@ class StrataStateCommitter:
         price = price_tick["price"]
         tick_ts = price_tick["timestamp"]
 
-        if self._is_new_tick(price, tick_ts):
-            state = self._build_state(price_tick, self._last_surface)
+        new_surface_ts = self._last_surface_ts
+
+        if self._is_new_tick(price, tick_ts, new_surface_ts):
+            state = self._build_state(price_tick, self._last_surface, new_surface_ts)
             if state:
                 self.buffer.append(state)
                 self._last_price = price
                 self._last_timestamp = tick_ts
+                self._last_surface_ts = new_surface_ts
                 logger.info(
                     "Committed state %s price=%.4f residual=%.4f center=%.4f width=%.4f buffer=%d",
                     self.symbol,
@@ -93,10 +101,12 @@ class StrataStateCommitter:
                     self.buffer.size(),
                 )
 
-    def _is_new_tick(self, price: float, timestamp: float) -> bool:
+    def _is_new_tick(self, price: float, timestamp: float, surface_ts: Optional[float]) -> bool:
         if self._last_timestamp is None:
             return True
         if timestamp > self._last_timestamp:
+            return True
+        if surface_ts is not None and self._last_surface_ts is not None and surface_ts > self._last_surface_ts:
             return True
         if price != self._last_price:
             if timestamp <= self._last_timestamp:
@@ -153,11 +163,12 @@ class StrataStateCommitter:
         self,
         price_tick: Dict,
         surface_snapshot: Optional[Dict],
+        surface_ts: Optional[float],
     ) -> Optional[StrataState]:
         price = float(price_tick["price"])
         timestamp = float(price_tick["timestamp"])
 
-        surface_ts, atm_iv = self._extract_surface(surface_snapshot, price)
+        surface_ts, atm_iv = self._extract_surface(surface_snapshot, price, surface_ts)
 
         residual, normalized_residual = self._compute_residual(price, timestamp)
         basin_center, basin_width = self._compute_basin(normalized_residual)
@@ -315,13 +326,13 @@ class StrataStateCommitter:
         return float(max(0.0, min(overall, 1.0)))
 
     def _extract_surface(
-        self, surface: Optional[Dict], spot: float
+        self, surface: Optional[Dict], spot: float, existing_ts: Optional[float]
     ) -> Tuple[Optional[float], Optional[float]]:
         if not surface:
-            return None, None
+            return existing_ts, None
 
         ts_raw = surface.get("timestamp") or surface.get("surface_timestamp")
-        surface_ts = self._to_timestamp(ts_raw) if ts_raw else None
+        surface_ts = self._to_timestamp(ts_raw) if ts_raw else existing_ts
 
         atm_iv = surface.get("atm_iv")
         if atm_iv is not None:

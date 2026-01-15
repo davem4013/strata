@@ -34,8 +34,8 @@ def get_latest_regime(symbol: str = Query(..., description="Asset symbol")):
     if buffer is None:
         raise HTTPException(status_code=404, detail="No regime buffer for symbol")
     state = buffer.latest()
-    if state is None:
-        return None
+    if state is None or buffer.size() == 0:
+        raise HTTPException(status_code=404, detail="No regime available")
     return asdict(state)
 
 
@@ -47,6 +47,8 @@ def get_regime_history(
     buffer = get_regime_buffer(symbol)
     if buffer is None:
         raise HTTPException(status_code=404, detail="No regime buffer for symbol")
+    if buffer.size() == 0:
+        raise HTTPException(status_code=404, detail="No regime available")
     states = buffer.history(limit)
     return [asdict(state) for state in states]
 

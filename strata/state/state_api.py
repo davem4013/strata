@@ -36,7 +36,7 @@ def get_latest_state(symbol: str = Query(..., description="Asset symbol")):
     if buffer is None:
         raise HTTPException(status_code=404, detail="No state buffer for symbol")
     state = buffer.latest()
-    if state is None:
+    if state is None or buffer.is_empty():
         raise HTTPException(status_code=404, detail="No state available")
     return asdict(state)
 
@@ -49,8 +49,34 @@ def get_state_history(
     buffer = get_buffer(symbol)
     if buffer is None:
         raise HTTPException(status_code=404, detail="No state buffer for symbol")
+    if buffer.is_empty():
+        raise HTTPException(status_code=404, detail="No state available")
     states = buffer.history(limit)
     return [asdict(state) for state in states]
+
+
+@router.get("/state/strata/status")
+def get_state_status(symbol: str = Query(..., description="Asset symbol")):
+    buffer = get_buffer(symbol)
+    if buffer is None:
+        raise HTTPException(status_code=404, detail="No state buffer for symbol")
+    if buffer.is_empty():
+        raise HTTPException(status_code=404, detail="No state available")
+
+    latest = buffer.latest()
+    last_ts = latest.timestamp if latest else None
+    age = None
+    if last_ts is not None:
+        import time
+        age = max(time.time() - float(last_ts), 0.0)
+
+    return {
+        "symbol": symbol,
+        "size": buffer.size(),
+        "max_size": buffer.maxlen,
+        "last_timestamp": last_ts,
+        "age_seconds": age,
+    }
 
 
 def attach_to_app(app) -> None:
