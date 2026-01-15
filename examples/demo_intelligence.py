@@ -79,9 +79,9 @@ def demo_intelligence_pipeline():
 
         print("\n[1.1] Generating market data...")
 
-        from strata.ingestion.market_data import AnalyticsAPIMarketDataIngester
+        from strata.ingestion.market_data import AnalyticsAPIIngester
 
-        ingester = AnalyticsAPIMarketDataIngester(
+        ingester = AnalyticsAPIIngester(
             base_url="http://127.0.0.1:8000"
         )
 

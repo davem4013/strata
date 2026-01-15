@@ -57,15 +57,17 @@ def demo_pipeline():
         logger.info("\n" + "-" * 80)
         logger.info("STEP 1: Generating Historical Market Data")
         logger.info("-" * 80)
-
        
-        from strata.ingestion.market_data import AnalyticsAPIMarketDataIngester
-
-        ingester = AnalyticsAPIMarketDataIngester(
-            base_url="http://127.0.0.1:8000"
+        from strata.ingestion.market_data import generate_historical_data
+        
+        logger.info(f"Fetching {n_historical_periods} historical periods from Analytics...")
+        generate_historical_data(
+            asset=asset,           # ← lowercase
+            timescale=timescale,   # ← lowercase
+            n_periods=n_historical_periods,
+            source="analytics"
         )
-
-        logger.info(f"Generating {n_historical_periods} days of synthetic data...")
+        logger.info(f"✓ Ingested {n_historical_periods} market data points from Analytics")
 
 
         logger.info(f"✓ Generated {n_historical_periods} market data points")
@@ -85,13 +87,16 @@ def demo_pipeline():
         from strata.analysis.residuals import analyze_residual_statistics
         stats = analyze_residual_statistics(asset, timescale)
 
-        logger.info("\nResidual Statistics:")
-        logger.info(f"  Count: {stats['count']}")
-        logger.info(f"  Mean: {stats['mean']:.4f}")
-        logger.info(f"  Std Dev: {stats['std']:.4f}")
-        logger.info(f"  Range: [{stats['min']:.4f}, {stats['max']:.4f}]")
-        logger.info(f"  Median: {stats['median']:.4f}")
-        logger.info(f"  Autocorr (lag 1): {stats.get('autocorr_lag1', 0):.4f}")
+        if stats is None:
+            logger.warning("Residual statistics unavailable (insufficient data); continuing")
+        else:
+            logger.info("\nResidual Statistics:")
+            logger.info(f"  Count: {stats['count']}")
+            logger.info(f"  Mean: {stats['mean']:.4f}")
+            logger.info(f"  Std Dev: {stats['std']:.4f}")
+            logger.info(f"  Range: [{stats['min']:.4f}, {stats['max']:.4f}]")
+            logger.info(f"  Median: {stats['median']:.4f}")
+            logger.info(f"  Autocorr (lag 1): {stats.get('autocorr_lag1', 0):.4f}")
 
         # Step 3: Identify basin
         logger.info("\n" + "-" * 80)

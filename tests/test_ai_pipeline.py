@@ -16,7 +16,7 @@ from strata.db.queries import (
     get_model_interpretations,
     get_agreement_metrics_current
 )
-from strata.ingestion.market_data import MockMarketDataIngester
+from strata.ingestion.market_data import AnalyticsAPIIngester, MockMarketDataIngester
 from strata.analysis.residuals import compute_residuals
 from strata.analysis.basins import identify_basins
 from strata.analysis.position import compute_basin_position
@@ -48,7 +48,7 @@ def test_model_analysis(db_connection):
 
     # Generate test basin data
     logger.info("\n[1/5] Generating test data...")
-    ingester = MockMarketDataIngester(seed=100)
+    ingester = AnalyticsAPIIngester()  # No seed needed - uses real data
 
     for i in range(50):
         timestamp = datetime.now() - timedelta(days=50 - i)

@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import pytest
-
+from strata.ingestion.market_data import AnalyticsAPIIngester
 from strata.config import DB_CONFIG, setup_logging
 from strata.db.connection import init_pool, close_pool
 from strata.db.queries import (
@@ -26,6 +26,7 @@ from strata.analysis.position import compute_basin_position, get_position_summar
 # Setup logging
 setup_logging()
 logger = logging.getLogger(__name__)
+timestamp = datetime.utcnow()
 
 
 @pytest.fixture(scope="module")
@@ -58,7 +59,7 @@ def test_full_pipeline(db_connection):
     # Step 1: Generate synthetic data
     logger.info(f"\n[1/5] Generating {n_periods} periods of synthetic data...")
 
-    ingester = MockMarketDataIngester(seed=42)
+    ingester = AnalyticsAPIIngester()  # No seed needed - uses real data
     start_time = datetime.now() - timedelta(days=n_periods)
 
     for i in range(n_periods):
