@@ -10,6 +10,7 @@ import pandas as pd
 
 from strata.config import BOUNDARY_SIGMA, BASIN_CLUSTERING_WINDOW
 import strata.db.queries as dbq
+from strata.state.basin_state import ResidualBasin
 
 logger = logging.getLogger(__name__)
 
@@ -77,15 +78,15 @@ def identify_basins(
         # Guard against degenerate std
         width = max(4.0 * std, 0.5)
 
-        basin_structure = {
-            'center': center,
-            'boundary_upper': center + width / 2,
-            'boundary_lower': center - width / 2,
-            'width': width,
-            'curvature': 0.0,
-            'sample_count': len(residuals)
-        }
-
+        basin_structure = ResidualBasin(
+            center=center,
+            width=width,
+            boundary_upper=center + width / 2,
+            boundary_lower=center - width / 2,
+            curvature=0.0,
+            sample_count=len(residuals),
+            variance=std * std,
+        )
 
 
     # Generate basin_id
@@ -95,18 +96,19 @@ def identify_basins(
     basin_velocity = compute_basin_velocity(basin_id, lookback=10)
 
     # Prepare data for database
+    basin_dict = basin_structure.to_dict()
     basin_data = {
         'basin_id': basin_id,
         'asset': asset,
         'timestamp': current_timestamp,
         'timescale': timescale,
-        'center_location': Decimal(str(round(basin_structure['center'], 6))),
+        'center_location': Decimal(str(round(basin_dict['center'], 6))),
         'center_velocity': Decimal(str(round(basin_velocity, 6))),
-        'boundary_upper': Decimal(str(round(basin_structure['boundary_upper'], 6))),
-        'boundary_lower': Decimal(str(round(basin_structure['boundary_lower'], 6))),
-        'basin_width': Decimal(str(round(basin_structure['width'], 4))),
-        'curvature': Decimal(str(round(basin_structure.get('curvature', 0.0), 4))),
-        'sample_count': basin_structure['sample_count']
+        'boundary_upper': Decimal(str(round(basin_dict['boundary_upper'], 6))),
+        'boundary_lower': Decimal(str(round(basin_dict['boundary_lower'], 6))),
+        'basin_width': Decimal(str(round(basin_dict['width'], 4))),
+        'curvature': Decimal(str(round(basin_dict.get('curvature', 0.0), 4))),
+        'sample_count': basin_dict['sample_count']
     }
 
     # Write to database
@@ -114,21 +116,21 @@ def identify_basins(
 
     logger.info(
         f"Identified basin for {asset} {timescale}: "
-        f"center={basin_structure['center']:.4f}, "
-        f"width={basin_structure['width']:.4f}, "
+        f"center={basin_structure.center:.4f}, "
+        f"width={basin_structure.width:.4f}, "
         f"velocity={basin_velocity:.6f}"
     )
 
     logger.debug(
-        f"  boundaries=[{basin_structure['boundary_lower']:.4f}, "
-        f"{basin_structure['boundary_upper']:.4f}], "
-        f"sample_count={basin_structure['sample_count']}"
+        f"  boundaries=[{basin_structure.boundary_lower:.4f}, "
+        f"{basin_structure.boundary_upper:.4f}], "
+        f"sample_count={basin_structure.sample_count}"
     )
 
     return basin_id
 
 
-def cluster_residuals(residuals: np.ndarray) -> Dict:
+def cluster_residuals(residuals: np.ndarray) -> ResidualBasin:
     """
     Analyze residual distribution to identify basin structure.
 
@@ -145,7 +147,7 @@ def cluster_residuals(residuals: np.ndarray) -> Dict:
         residuals: Array of normalized residuals
 
     Returns:
-        Dict with basin parameters:
+        ResidualBasin with basin parameters:
         - center: Mean residual
         - boundary_upper: Upper boundary (+N sigma)
         - boundary_lower: Lower boundary (-N sigma)
@@ -162,13 +164,6 @@ def cluster_residuals(residuals: np.ndarray) -> Dict:
     # Calculate spread (standard deviation)
     std = float(np.std(residuals, ddof=1))
 
-    # Define boundaries at ±N sigma
-    boundary_upper = center + (BOUNDARY_SIGMA * std)
-    boundary_lower = center - (BOUNDARY_SIGMA * std)
-
-    # Calculate width
-    width = boundary_upper - boundary_lower
-
     # Calculate curvature (second derivative of density)
     # For now, use kurtosis as a proxy for basin stiffness
     # High kurtosis = sharp basin (high curvature)
@@ -181,21 +176,20 @@ def cluster_residuals(residuals: np.ndarray) -> Dict:
     except Exception:
         curvature = 0.5  # Default neutral curvature
 
-    result = {
-        'center': center,
-        'boundary_upper': boundary_upper,
-        'boundary_lower': boundary_lower,
-        'width': width,
-        'sample_count': len(residuals),
-        'curvature': curvature
-    }
+    basin = ResidualBasin.from_geometry(
+        center=center,
+        std=std,
+        boundary_sigma=BOUNDARY_SIGMA,
+        sample_count=len(residuals),
+        curvature=curvature,
+    )
 
     logger.debug(
         f"Basin clustering: center={center:.4f}, std={std:.4f}, "
-        f"width={width:.4f}, curvature={curvature:.4f}"
+        f"width={basin.width:.4f}, curvature={curvature:.4f}"
     )
 
-    return result
+    return basin
 
 
 def compute_basin_velocity(basin_id: str, lookback: int = 10) -> float:

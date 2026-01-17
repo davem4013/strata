@@ -56,7 +56,17 @@ ai = [
 strata = "strata.orchestration.pipeline:main"
 
 [tool.setuptools]
-packages = ["strata", "strata.db", "strata.ingestion", "strata.analysis", "strata.ai", "strata.events", "strata.orchestration"]
+packages = [
+  "strata",
+  "strata.db",
+  "strata.ingestion",
+  "strata.analysis",
+  "strata.ai",
+  "strata.events",
+  "strata.orchestration",
+  "strata.state"
+]
+
 
 [tool.black]
 line-length = 100

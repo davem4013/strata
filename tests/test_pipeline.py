@@ -168,34 +168,34 @@ def test_basin_clustering():
     mean_reverting = np.random.normal(0, 0.5, 100)
 
     basin1 = cluster_residuals(mean_reverting)
-    logger.info(f"  Center: {basin1['center']:.4f}")
-    logger.info(f"  Width: {basin1['width']:.4f}")
-    logger.info(f"  Boundaries: [{basin1['boundary_lower']:.4f}, {basin1['boundary_upper']:.4f}]")
+    logger.info(f"  Center: {basin1.center:.4f}")
+    logger.info(f"  Width: {basin1.width:.4f}")
+    logger.info(f"  Boundaries: [{basin1.boundary_lower:.4f}, {basin1.boundary_upper:.4f}]")
 
-    assert abs(basin1['center']) < 0.5, "Center should be near 0 for mean-reverting data"
-    assert basin1['width'] < 3.0, "Width should be narrow for mean-reverting data"
+    assert abs(basin1.center) < 0.5, "Center should be near 0 for mean-reverting data"
+    assert basin1.width < 3.0, "Width should be narrow for mean-reverting data"
 
     # Test 2: Trending data (should have wider basin or off-center)
     logger.info("\n[2/3] Testing trending data...")
     trending = np.linspace(-1, 1, 100) + np.random.normal(0, 0.3, 100)
 
     basin2 = cluster_residuals(trending)
-    logger.info(f"  Center: {basin2['center']:.4f}")
-    logger.info(f"  Width: {basin2['width']:.4f}")
-    logger.info(f"  Boundaries: [{basin2['boundary_lower']:.4f}, {basin2['boundary_upper']:.4f}]")
+    logger.info(f"  Center: {basin2.center:.4f}")
+    logger.info(f"  Width: {basin2.width:.4f}")
+    logger.info(f"  Boundaries: [{basin2.boundary_lower:.4f}, {basin2.boundary_upper:.4f}]")
 
-    assert basin2['width'] > 0, "Width should be positive"
+    assert basin2.width > 0, "Width should be positive"
 
     # Test 3: High volatility data (should have wide basin)
     logger.info("\n[3/3] Testing high volatility data...")
     high_vol = np.random.normal(0, 2.0, 100)
 
     basin3 = cluster_residuals(high_vol)
-    logger.info(f"  Center: {basin3['center']:.4f}")
-    logger.info(f"  Width: {basin3['width']:.4f}")
-    logger.info(f"  Boundaries: [{basin3['boundary_lower']:.4f}, {basin3['boundary_upper']:.4f}]")
+    logger.info(f"  Center: {basin3.center:.4f}")
+    logger.info(f"  Width: {basin3.width:.4f}")
+    logger.info(f"  Boundaries: [{basin3.boundary_lower:.4f}, {basin3.boundary_upper:.4f}]")
 
-    assert basin3['width'] > basin1['width'], "High vol should have wider basin than low vol"
+    assert basin3.width > basin1.width, "High vol should have wider basin than low vol"
 
     logger.info("\n✓ Basin clustering test PASSED")
 

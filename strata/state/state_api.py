@@ -1,6 +1,6 @@
-"""Read-only FastAPI endpoints for in-memory STRATA state."""
+"""Read-only STRATA state APIs (pure Python and FastAPI adapters)."""
 from dataclasses import asdict
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import logging
 
 try:
@@ -11,6 +11,8 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from .state_buffer import StrataStateBuffer
+from . import strata_buffer as sb
+from .strata_buffer import BasinFrame
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,24 @@ STATE_BUFFERS: Dict[str, StrataStateBuffer] = {}
 router = APIRouter()
 
 
+# -------------------------
+# Pure Python snapshot API
+# -------------------------
+def get_latest_basin_frame() -> Optional[BasinFrame]:
+    """Return the most recent interpreted basin frame (or None)."""
+    return sb.STRATA_BUFFER.latest()
+
+
+def get_basin_history(n: int = 100) -> List[BasinFrame]:
+    """Return up to the last n basin frames (oldest → newest)."""
+    if n <= 0:
+        return []
+    return sb.STRATA_BUFFER.history(n)
+
+
+# -------------------------
+# FastAPI adapter (legacy)
+# -------------------------
 def register_buffer(symbol: str, buffer: StrataStateBuffer) -> None:
     """Register a buffer for a symbol (uppercased)."""
     STATE_BUFFERS[symbol.upper()] = buffer

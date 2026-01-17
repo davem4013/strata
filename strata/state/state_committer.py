@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import requests
@@ -13,7 +13,10 @@ from strata.analysis.basins import cluster_residuals
 from strata.analysis.position import calculate_position_state, compute_lag_score
 from strata.analysis.residuals import fit_least_squares
 from strata.config import BASIN_CLUSTERING_WINDOW, RESIDUAL_LOOKBACK_PERIODS
-from .state_buffer import StrataStateBuffer
+from .basin_state import ResidualBasin
+from .state_buffer import BasinBuffer, StrataStateBuffer
+from .state_frame import StateFrame, StateFrameBuffer
+from .strata_buffer import append_interpreted_state
 from .strata_state import StrataState
 
 logger = logging.getLogger(__name__)
@@ -29,14 +32,20 @@ class StrataStateCommitter:
         analytics_url: str,
         symbol: str,
         buffer: StrataStateBuffer,
+        frame_buffer: Optional[StateFrameBuffer] = None,
+        frame_timescale: float = 0.0,
         poll_seconds: float = 1.0,
         surface_poll_seconds: float = 10.0,
+        basin_buffer: Optional[BasinBuffer] = None,
     ):
         self.analytics_url = analytics_url.rstrip("/")
         self.symbol = symbol
         self.buffer = buffer
+        self.frame_buffer = frame_buffer
+        self.frame_timescale = float(frame_timescale)
         self.poll_seconds = poll_seconds
         self.surface_poll_seconds = surface_poll_seconds
+        self.basin_buffer = basin_buffer or BasinBuffer()
 
         self._last_price: Optional[float] = None
         self._last_timestamp: Optional[float] = None
@@ -88,6 +97,8 @@ class StrataStateCommitter:
             state = self._build_state(price_tick, self._last_surface, new_surface_ts)
             if state:
                 self.buffer.append(state)
+                append_interpreted_state(state)
+                self._push_frame(state, price_tick, self._last_surface)
                 self._last_price = price
                 self._last_timestamp = tick_ts
                 self._last_surface_ts = new_surface_ts
@@ -171,7 +182,9 @@ class StrataStateCommitter:
         surface_ts, atm_iv = self._extract_surface(surface_snapshot, price, surface_ts)
 
         residual, normalized_residual = self._compute_residual(price, timestamp)
-        basin_center, basin_width = self._compute_basin(normalized_residual)
+        basin = self._compute_basin(normalized_residual)
+        basin_center = basin.center
+        basin_width = basin.width
         basin_velocity = self._compute_basin_velocity(basin_center, timestamp)
         price_velocity = self._compute_price_velocity(normalized_residual, timestamp)
 
@@ -220,12 +233,8 @@ class StrataStateCommitter:
             risk_score=risk_score,
         )
 
-    def _compute_residual(
-        self, price: float, timestamp: float
-    ) -> Tuple[float, float]:
-        history = self.buffer.history(RESIDUAL_LOOKBACK_PERIODS - 1)
-        prices = [state.spot for state in history] + [price]
-        times = [state.timestamp for state in history] + [timestamp]
+    def _compute_residual(self, price: float, timestamp: float) -> Tuple[float, float]:
+        prices, times = self._regression_window(price, timestamp)
 
         if len(prices) < 2:
             return 0.0, 0.0
@@ -241,26 +250,74 @@ class StrataStateCommitter:
 
         return float(residual), float(normalized_residual)
 
-    def _compute_basin(self, normalized_residual: float) -> Tuple[float, float]:
+    def _regression_window(self, price: float, timestamp: float) -> Tuple[list, list]:
+        """
+        Build regression series using rolling state frames if available.
+
+        Falls back to StrataState history when no frame buffer is configured.
+        """
+        if self.frame_buffer is not None:
+            window = self.frame_buffer.get_window(RESIDUAL_LOOKBACK_PERIODS - 1)
+            prices = [frame.price for frame in window] + [price]
+            times = [frame.timestamp for frame in window] + [timestamp]
+        else:
+            history = self.buffer.history(RESIDUAL_LOOKBACK_PERIODS - 1)
+            prices = [state.spot for state in history] + [price]
+            times = [state.timestamp for state in history] + [timestamp]
+
+        return prices, times
+
+    def _compute_basin(self, normalized_residual: float) -> ResidualBasin:
         residuals = [s.normalized_residual for s in self.buffer.history(BASIN_CLUSTERING_WINDOW - 1)]
         residuals.append(normalized_residual)
 
         if len(residuals) < 2:
-            return normalized_residual, 1.0
+            basin = ResidualBasin(
+                center=float(normalized_residual),
+                width=1.0,
+                boundary_upper=float(normalized_residual) + 0.5,
+                boundary_lower=float(normalized_residual) - 0.5,
+                curvature=0.5,
+                sample_count=len(residuals),
+                variance=0.0,
+            )
+            self.basin_buffer.push(basin)
+            return basin
 
         residual_array = np.array(residuals[-BASIN_CLUSTERING_WINDOW:], dtype=float)
 
         try:
-            structure = cluster_residuals(residual_array)
-            center = float(structure["center"])
-            width = float(structure["width"])
+            basin = cluster_residuals(residual_array)
         except Exception as exc:
             logger.debug("Basin clustering fallback for %s: %s", self.symbol, exc)
             center = float(np.mean(residual_array))
             std = float(np.std(residual_array, ddof=1)) if len(residual_array) > 1 else 0.0
             width = max(4.0 * std, 0.5)
+            basin = ResidualBasin(
+                center=center,
+                width=width,
+                boundary_upper=center + width / 2.0,
+                boundary_lower=center - width / 2.0,
+                curvature=0.5,
+                sample_count=len(residual_array),
+                variance=float(std * std),
+            )
 
-        return center, max(width, 1e-6)
+        # Keep downstream calculations safe and deterministic even if width is degenerate.
+        if basin.width <= 0:
+            safe_width = max(basin.width, 1e-6)
+            basin = ResidualBasin(
+                center=basin.center,
+                width=safe_width,
+                boundary_upper=basin.center + safe_width / 2.0,
+                boundary_lower=basin.center - safe_width / 2.0,
+                curvature=basin.curvature,
+                sample_count=basin.sample_count,
+                variance=basin.variance,
+            )
+
+        self.basin_buffer.push(basin)
+        return basin
 
     def _compute_basin_velocity(self, center: float, timestamp: float) -> float:
         history = self.buffer.history(10)
@@ -369,6 +426,55 @@ class StrataStateCommitter:
         except Exception as exc:
             logger.debug("ATM IV extraction failed: %s", exc)
         return None
+
+    def _push_frame(
+        self,
+        state: StrataState,
+        price_tick: Dict[str, Any],
+        surface_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        """Build and push a StateFrame into the frame buffer if configured."""
+        if self.frame_buffer is None:
+            return
+
+        frame = self._build_state_frame(state, price_tick, surface_snapshot)
+        if frame:
+            self.frame_buffer.push(frame)
+
+    def _build_state_frame(
+        self,
+        state: StrataState,
+        price_tick: Dict[str, Any],
+        surface_snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[StateFrame]:
+        surface = surface_snapshot or {}
+
+        def _as_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        sd_bands = surface.get("sd_bands")
+        sd_upper = _as_float(sd_bands.get("upper"), 0.0) if isinstance(sd_bands, dict) else 0.0
+        sd_lower = _as_float(sd_bands.get("lower"), 0.0) if isinstance(sd_bands, dict) else 0.0
+
+        return StateFrame(
+            timestamp=state.timestamp,
+            asset=self.symbol,
+            timescale=self.frame_timescale,
+            price=state.spot,
+            atm_iv=_as_float(state.atm_iv, 0.0) if state.atm_iv is not None else 0.0,
+            iv_25d_call=_as_float(surface.get("iv_25d_call"), 0.0),
+            iv_25d_put=_as_float(surface.get("iv_25d_put"), 0.0),
+            iv_slope=_as_float(surface.get("iv_slope"), 0.0),
+            sd_band_upper=sd_upper,
+            sd_band_lower=sd_lower,
+            delta_pressure=_as_float(surface.get("delta_pressure"), 0.0),
+            gamma_exposure=_as_float(surface.get("gamma_exposure"), 0.0),
+            vanna=_as_float(surface.get("vanna"), 0.0),
+            vol_of_vol=_as_float(surface.get("vol_of_vol"), 0.0),
+        )
 
     @staticmethod
     def _to_timestamp(value) -> float:

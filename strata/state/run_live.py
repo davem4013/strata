@@ -5,6 +5,7 @@ import threading
 import time
 
 from .state_buffer import StrataStateBuffer
+from .state_frame import StateFrameBuffer
 from .state_committer import StrataStateCommitter
 from .regime_buffer import RegimeBuffer
 from .regime_committer import RegimeCommitter
@@ -50,6 +51,7 @@ def main() -> None:
     args = parser.parse_args()
 
     state_buffer = StrataStateBuffer()
+    state_frame_buffer = StateFrameBuffer()
     regime_buffer = RegimeBuffer()
 
     # Register buffers with FastAPI router if available
@@ -65,6 +67,8 @@ def main() -> None:
         analytics_url=args.analytics_url,
         symbol=args.symbol,
         buffer=state_buffer,
+        frame_buffer=state_frame_buffer,
+        frame_timescale=args.poll_seconds,
         poll_seconds=args.poll_seconds,
         surface_poll_seconds=args.surface_poll_seconds,
     )
