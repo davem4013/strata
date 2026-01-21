@@ -1,11 +1,17 @@
-"""Rolling buffer for interpreted STRATA frames."""
-from collections import deque
-from typing import Deque, Generic, List, Optional, TypeVar
+"""
+Rolling buffer for interpreted STRATA frames.
+"""
 
+from collections import deque
+from datetime import datetime, timezone
+from typing import Deque, Generic, List, Optional, TypeVar, Union
+
+from strata.analysis.residuals import ResidualGeometry
 from .basin_frame import BasinFrame
+from .basin_geometry import BasinGeometryBuilder, BasinGeometryFrame, EVENT_RESET
 from .strata_state import StrataState
 
-T = TypeVar("T", bound=BasinFrame)
+T = TypeVar("T")
 
 
 class StrataBuffer(Generic[T]):
@@ -34,39 +40,230 @@ class StrataBuffer(Generic[T]):
     def maxlen(self) -> int:
         return self._maxlen
 
+    def size(self) -> int:
+        """Return current number of frames."""
+        return len(self._frames)
 
-# Shared buffer instance owned by STRATA
+    def clear(self) -> None:
+        """Remove all frames."""
+        self._frames.clear()
+
+
+# ---------------------------------------------------------------------
+# Shared buffers owned by STRATA
+# ---------------------------------------------------------------------
+
 STRATA_BUFFER: StrataBuffer[BasinFrame] = StrataBuffer()
+strata_buffer = STRATA_BUFFER  # legacy alias
+
+GEOMETRY_BUFFER: StrataBuffer[BasinGeometryFrame] = StrataBuffer()
+geometry_buffer = GEOMETRY_BUFFER
+
+_GEOMETRY_BUILDER = BasinGeometryBuilder(radius=2.0, trail_length=30)
 
 
-def to_basin_frame(state: StrataState) -> BasinFrame:
-    """Interpret a StrataState into a BasinFrame without altering underlying math."""
-    center_val = state.basin_center
-    center = [center_val] if center_val is not None else []
+# ---------------------------------------------------------------------
+# Legacy frame builders
+# ---------------------------------------------------------------------
 
-    radius = state.basin_width / 2.0 if state.basin_width is not None else None
-    velocity = state.basin_velocity if state.basin_velocity is not None else None
+def _legacy_frame_from_geometry(symbol: str, geometry: ResidualGeometry) -> BasinFrame:
+    ts = geometry.timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = ts.astimezone(timezone.utc)
 
-    # Simple compression proxy: narrower basins imply higher compression; avoid division by zero.
-    compression = None
-    if state.basin_width:
-        compression = 1.0 / float(state.basin_width) if state.basin_width != 0 else None
-
-    residual_norm = abs(state.normalized_residual) if state.normalized_residual is not None else None
+    centroid = (
+        geometry.centroid.tolist()
+        if hasattr(geometry.centroid, "tolist")
+        else list(geometry.centroid)
+    )
 
     return BasinFrame(
-        timestamp=float(state.timestamp),
-        basin_center=center,
-        basin_radius=radius,
-        basin_velocity=velocity,
-        compression=compression,
-        residual_norm=residual_norm,
-        stability_score=None,
+        timestamp=ts.isoformat(),
+        symbol=symbol,
+        domain_dim=geometry.domain_dim,
+        residual_energy=float(geometry.residual_energy),
+        residual_max=float(geometry.residual_max),
+        centroid=[float(x) for x in centroid],
+        fit_quality=float(geometry.fit_quality),
+        basins=[],
     )
 
 
-def append_interpreted_state(state: StrataState, buffer: Optional[StrataBuffer[BasinFrame]] = None) -> None:
-    """Append an interpreted BasinFrame to the provided or shared buffer."""
+def _legacy_frame_from_state(state: StrataState) -> BasinFrame:
+    ts = datetime.fromtimestamp(float(state.timestamp), tz=timezone.utc)
+
+    residual_energy = abs(state.residual) if state.residual is not None else 0.0
+    residual_max = (
+        max(abs(state.normalized_residual), residual_energy)
+        if state.normalized_residual is not None
+        else residual_energy
+    )
+
+    residual_coord = state.normalized_residual
+    response = state.response
+    domain_dim = 2 if response is not None else 1  # 2D when response is present (including 0), else legacy 1D
+
+    return BasinFrame(
+        timestamp=ts.isoformat(),
+        symbol=state.symbol,
+        domain_dim=domain_dim,
+        residual_energy=float(residual_energy),
+        residual_max=float(residual_max),
+        centroid=[float(state.basin_center)],
+        fit_quality=1.0,
+        basins=[],
+        residual_coordinate=float(residual_coord) if residual_coord is not None else None,
+        response=response if response is not None else None,
+    )
+
+
+# ---------------------------------------------------------------------
+# Geometry frame builders
+# ---------------------------------------------------------------------
+
+def _geometry_frame_from_geometry(symbol: str, geometry: ResidualGeometry) -> BasinGeometryFrame:
+    ts = geometry.timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = ts.astimezone(timezone.utc)
+
+    centroid = (
+        geometry.centroid.tolist()
+        if hasattr(geometry.centroid, "tolist")
+        else list(geometry.centroid)
+    )
+    center_hint = float(centroid[0]) if centroid else 0.0
+
+    return _GEOMETRY_BUILDER.from_geometry(
+        symbol=symbol,
+        timestamp=ts,
+        center_hint=center_hint,
+        residual_energy=float(geometry.residual_energy),
+        residual_max=float(geometry.residual_max),
+    )
+
+
+def _geometry_frame_from_state(state: StrataState) -> BasinGeometryFrame:
+    residual_energy = abs(state.residual) if state.residual is not None else 0.0
+    normalized_residual = state.normalized_residual or 0.0
+    residual_max = max(abs(normalized_residual), residual_energy)
+
+    return _GEOMETRY_BUILDER.from_state(
+        timestamp=float(state.timestamp),
+        symbol=state.symbol,
+        normalized_residual=float(normalized_residual),
+        basin_center=float(state.basin_center),
+        basin_width=float(state.basin_width),
+        basin_velocity=float(state.basin_velocity),
+        residual_energy=float(residual_energy),
+        residual_max=float(residual_max),
+    )
+
+
+# ---------------------------------------------------------------------
+# Public update helpers
+# ---------------------------------------------------------------------
+
+def update_from_residual_geometry(
+    symbol: str,
+    geometry: ResidualGeometry,
+    buffer: Optional[StrataBuffer[BasinFrame]] = None,
+) -> BasinFrame:
     target = buffer or STRATA_BUFFER
-    frame = to_basin_frame(state)
+    frame = _legacy_frame_from_geometry(symbol, geometry)
     target.append(frame)
+
+    try:
+        update_geometry_from_residual(symbol, geometry)
+    except Exception:
+        pass
+
+    return frame
+
+
+def update_from_state(
+    state: StrataState,
+    buffer: Optional[StrataBuffer[BasinFrame]] = None,
+) -> BasinFrame:
+    target = buffer or STRATA_BUFFER
+    frame = _legacy_frame_from_state(state)
+    target.append(frame)
+
+    try:
+        update_geometry_from_state(state)
+    except Exception:
+        pass
+
+    return frame
+
+
+def append_interpreted_state(
+    state_or_geometry: Union[StrataState, ResidualGeometry],
+    buffer: Optional[StrataBuffer[BasinFrame]] = None,
+) -> None:
+    target = buffer or STRATA_BUFFER
+
+    if isinstance(state_or_geometry, ResidualGeometry):
+        update_from_residual_geometry(
+            symbol=getattr(state_or_geometry, "symbol", "UNKNOWN"),
+            geometry=state_or_geometry,
+            buffer=target,
+        )
+        return
+
+    update_from_state(state_or_geometry, buffer=target)
+
+
+def update_geometry_from_residual(
+    symbol: str,
+    geometry: ResidualGeometry,
+    buffer: Optional[StrataBuffer[BasinGeometryFrame]] = None,
+) -> BasinGeometryFrame:
+    target = buffer or GEOMETRY_BUFFER
+    frame = _geometry_frame_from_geometry(symbol, geometry)
+    target.append(frame)
+    return frame
+
+
+def update_geometry_from_state(
+    state: StrataState,
+    buffer: Optional[StrataBuffer[BasinGeometryFrame]] = None,
+) -> BasinGeometryFrame:
+    target = buffer or GEOMETRY_BUFFER
+    frame = _geometry_frame_from_state(state)
+    target.append(frame)
+    return frame
+
+
+def append_geometry(
+    state_or_geometry: Union[StrataState, ResidualGeometry],
+    buffer: Optional[StrataBuffer[BasinGeometryFrame]] = None,
+) -> None:
+    target = buffer or GEOMETRY_BUFFER
+
+    if isinstance(state_or_geometry, ResidualGeometry):
+        update_geometry_from_residual(
+            symbol=getattr(state_or_geometry, "symbol", "UNKNOWN"),
+            geometry=state_or_geometry,
+            buffer=target,
+        )
+        return
+
+    update_geometry_from_state(state_or_geometry, buffer=target)
+
+
+# ---------------------------------------------------------------------
+# Backwards compatibility (MUST be last)
+# ---------------------------------------------------------------------
+
+StateBuffer = StrataBuffer
+
+__all__ = [
+    "StrataBuffer",
+    "StateBuffer",
+    "STRATA_BUFFER",
+    "GEOMETRY_BUFFER",
+]

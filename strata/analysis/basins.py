@@ -54,17 +54,41 @@ def identify_basins(
         )
         return None
 
-    # Extract normalized residuals
+    # Extract normalized residuals and optional response (if available).
     df = pd.DataFrame(data)
     df = df.sort_values('timestamp')
 
     residuals = df['normalized_residual'].astype(float).values
+    residual_input = residuals
+
+    # When response is present, move to 2D (residual, response) space; rows with
+    # missing response stay in 1D. Time is not a spatial dimension here.
+    if "response" in df.columns and df["response"].notna().any():
+        df_2d = df[df["response"].notna()]
+        if len(df_2d) >= 2:
+            residual_input = np.column_stack(
+                [
+                    df_2d["normalized_residual"].astype(float).values,
+                    df_2d["response"].astype(float).values,
+                ]
+            )
+        else:
+            logger.debug("Insufficient response-bearing points for 2D clustering; using 1D residuals.")
+
     current_timestamp = df.iloc[-1]['timestamp']
+
+    effective_count = residual_input.shape[0] if isinstance(residual_input, np.ndarray) and residual_input.ndim > 0 else len(residual_input)
+    if effective_count < MIN_RESIDUALS:
+        logger.warning(
+            f"Insufficient points for basin identification in active domain: "
+            f"{effective_count} < {MIN_RESIDUALS} for {asset} {timescale}"
+        )
+        return None
 
     # Cluster residuals to find basin structure
 
     try:
-        basin_structure = cluster_residuals(residuals)
+        basin_structure = cluster_residuals(residual_input)
     except Exception as e:
         logger.warning(
             f"Clustering failed for {asset} {timescale}, "
@@ -134,17 +158,16 @@ def cluster_residuals(residuals: np.ndarray) -> ResidualBasin:
     """
     Analyze residual distribution to identify basin structure.
 
-    In the current implementation (Phase 1D - one-dimensional analysis),
-    we use simple statistical measures to define the basin:
-    - Center: mean of residuals
-    - Boundaries: ±N sigma from center (N = BOUNDARY_SIGMA)
-    - Width: distance between boundaries
-
-    Future implementations may use more sophisticated clustering
-    (e.g., GMM, DBSCAN) for multi-basin detection.
+    Domain gating:
+    - 1D (legacy): operate on residuals only, unchanged.
+    - 2D: operate in (residual_coordinate, response) space when both dimensions
+      are present. Time is not a spatial dimension here; only residual vs. response
+      define the phase-space point.
 
     Args:
-        residuals: Array of normalized residuals
+        residuals: Array of normalized residuals, shape (N,) for 1D or (N, 2)
+            for 2D (residual_coordinate, response). Points with response=None/NaN
+            must be filtered out by the caller or will be dropped here.
 
     Returns:
         ResidualBasin with basin parameters:
@@ -158,38 +181,95 @@ def cluster_residuals(residuals: np.ndarray) -> ResidualBasin:
     if len(residuals) < 2:
         raise ValueError("Need at least 2 residuals for clustering")
 
-    # Calculate center (mean)
-    center = float(np.mean(residuals))
+    arr = np.asarray(residuals, dtype=float)
 
-    # Calculate spread (standard deviation)
-    std = float(np.std(residuals, ddof=1))
+    # Legacy 1D path: unchanged behavior.
+    if arr.ndim == 1:
+        # Calculate center (mean)
+        center = float(np.mean(arr))
 
-    # Calculate curvature (second derivative of density)
-    # For now, use kurtosis as a proxy for basin stiffness
-    # High kurtosis = sharp basin (high curvature)
-    # Low kurtosis = flat basin (low curvature)
-    from scipy.stats import kurtosis
-    try:
-        kurt = float(kurtosis(residuals, fisher=True))
-        # Normalize to [0, 1] range (approximate)
-        curvature = 1.0 / (1.0 + np.exp(-kurt))
-    except Exception:
-        curvature = 0.5  # Default neutral curvature
+        # Calculate spread (standard deviation)
+        std = float(np.std(arr, ddof=1))
 
-    basin = ResidualBasin.from_geometry(
-        center=center,
-        std=std,
-        boundary_sigma=BOUNDARY_SIGMA,
-        sample_count=len(residuals),
-        curvature=curvature,
-    )
+        # Calculate curvature (second derivative of density)
+        # For now, use kurtosis as a proxy for basin stiffness
+        # High kurtosis = sharp basin (high curvature)
+        # Low kurtosis = flat basin (low curvature)
+        from scipy.stats import kurtosis
+        try:
+            kurt = float(kurtosis(arr, fisher=True))
+            # Normalize to [0, 1] range (approximate)
+            curvature = 1.0 / (1.0 + np.exp(-kurt))
+        except Exception:
+            curvature = 0.5  # Default neutral curvature
 
-    logger.debug(
-        f"Basin clustering: center={center:.4f}, std={std:.4f}, "
-        f"width={basin.width:.4f}, curvature={curvature:.4f}"
-    )
+        basin = ResidualBasin.from_geometry(
+            center=center,
+            std=std,
+            boundary_sigma=BOUNDARY_SIGMA,
+            sample_count=len(arr),
+            curvature=curvature,
+        )
 
-    return basin
+        logger.debug(
+            f"Basin clustering: center={center:.4f}, std={std:.4f}, "
+            f"width={basin.width:.4f}, curvature={curvature:.4f}"
+        )
+
+        return basin
+
+    # 2D path: residual_coordinate + response (normalized Euclidean over axis-aligned spreads).
+    if arr.ndim == 2 and arr.shape[1] >= 2:
+        coords = arr[:, :2]
+        # Drop rows with missing response; ensures domain_dim reflects active dimensions only.
+        mask = ~np.isnan(coords).any(axis=1)
+        coords = coords[mask]
+        if len(coords) < 2:
+            raise ValueError("Need at least 2 points with response for 2D clustering")
+
+        residuals_1d = coords[:, 0]
+        responses_1d = coords[:, 1]
+
+        center_vec = coords.mean(axis=0).tolist()
+        std_vec = coords.std(axis=0, ddof=1)
+        # Axis-aligned covariance keeps membership based on normalized Euclidean distance.
+        covariance = np.diag(std_vec ** 2).tolist()
+        width_vec = (2.0 * BOUNDARY_SIGMA * std_vec).tolist()
+
+        # Legacy scalar fields remain tied to the residual axis for compatibility.
+        center = float(center_vec[0])
+        std_residual = float(std_vec[0])
+
+        from scipy.stats import kurtosis
+        try:
+            kurt_residual = float(kurtosis(residuals_1d, fisher=True))
+            curvature = 1.0 / (1.0 + np.exp(-kurt_residual))
+        except Exception:
+            curvature = 0.5
+
+        basin = ResidualBasin.from_geometry(
+            center=center,
+            std=std_residual,
+            boundary_sigma=BOUNDARY_SIGMA,
+            sample_count=len(coords),
+            curvature=curvature,
+            domain_dim=2,
+            center_vector=[float(center_vec[0]), float(center_vec[1])],
+            width_vector=[float(width_vec[0]), float(width_vec[1])],
+            covariance=covariance,
+        )
+
+        logger.debug(
+            "2D basin clustering: center_vec=%s, std_vec=%s, width_vec=%s, curvature=%.4f",
+            center_vec,
+            std_vec.tolist(),
+            width_vec,
+            curvature,
+        )
+
+        return basin
+
+    raise ValueError("Unsupported residuals shape for clustering")
 
 
 def compute_basin_velocity(basin_id: str, lookback: int = 10) -> float:

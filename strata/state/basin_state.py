@@ -1,6 +1,6 @@
 """Immutable basin geometry snapshot for residual clustering."""
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,12 @@ class ResidualBasin:
     curvature: float
     sample_count: int
     variance: float
+
+    # Optional 2D metadata (residual_coordinate, response) for domain_dim == 2.
+    domain_dim: int = 1
+    center_vector: Optional[List[float]] = None  # [residual_center, response_center]
+    width_vector: Optional[List[float]] = None   # axis-aligned spreads (residual, response)
+    covariance: Optional[List[List[float]]] = None  # axis-aligned covariance matrix (diagonal)
 
     @property
     def radius(self) -> float:
@@ -61,7 +67,7 @@ class ResidualBasin:
 
     def to_dict(self) -> Dict:
         """Legacy dictionary shape used by downstream serialization/DB writes."""
-        return {
+        base = {
             "center": float(self.center),
             "boundary_upper": float(self.boundary_upper),
             "boundary_lower": float(self.boundary_lower),
@@ -69,6 +75,13 @@ class ResidualBasin:
             "sample_count": int(self.sample_count),
             "curvature": float(self.curvature),
         }
+        # Preserve legacy shape while allowing 2D metadata when present.
+        if self.domain_dim > 1:
+            base["center_vector"] = list(self.center_vector) if self.center_vector else None
+            base["width_vector"] = list(self.width_vector) if self.width_vector else None
+            base["covariance"] = self.covariance
+            base["domain_dim"] = int(self.domain_dim)
+        return base
 
     @classmethod
     def from_geometry(
@@ -79,6 +92,10 @@ class ResidualBasin:
         boundary_sigma: float,
         sample_count: int,
         curvature: float,
+        domain_dim: int = 1,
+        center_vector: Optional[List[float]] = None,
+        width_vector: Optional[List[float]] = None,
+        covariance: Optional[List[List[float]]] = None,
     ) -> "ResidualBasin":
         boundary_upper = center + (boundary_sigma * std)
         boundary_lower = center - (boundary_sigma * std)
@@ -92,6 +109,10 @@ class ResidualBasin:
             curvature=float(curvature),
             sample_count=int(sample_count),
             variance=float(variance),
+            domain_dim=int(domain_dim),
+            center_vector=center_vector,
+            width_vector=width_vector,
+            covariance=covariance,
         )
 
 

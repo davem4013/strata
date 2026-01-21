@@ -1,7 +1,16 @@
-"""Residual calculation using least squares regression."""
+"""Residual geometry engine.
+
+This module now treats residuals as geometric objects rather than decisions.
+The core `ResidualFitter` fits a linear model (via arbitrary feature maps) over
+an N-dimensional domain (1D or 2D today), returns the raw residual field, and
+summarizes that field into lightweight geometry for STRATA v0.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Tuple, Optional
+from typing import Callable, Optional, Tuple
 import logging
 
 import numpy as np
@@ -12,6 +21,133 @@ from strata.config import RESIDUAL_LOOKBACK_PERIODS
 from strata.db.queries import get_recent_market_data, write_residual_state
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResidualField:
+    """Scattered residual samples over an arbitrary domain."""
+
+    coords: np.ndarray
+    values: np.ndarray
+    predictions: np.ndarray
+    residuals: np.ndarray
+    coefficients: np.ndarray
+
+
+@dataclass
+class ResidualGeometry:
+    """Lightweight geometry summary consumed by STRATA v0."""
+
+    timestamp: datetime
+    domain_dim: int
+    residual_energy: float
+    residual_max: float
+    centroid: np.ndarray
+    fit_quality: float
+    sample_count: int
+
+    def as_dict(self) -> dict:
+        """Convert to serializable dict for downstream components."""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "domain_dim": self.domain_dim,
+            "residual_energy": self.residual_energy,
+            "residual_max": self.residual_max,
+            "centroid": self.centroid.tolist(),
+            "fit_quality": self.fit_quality,
+            "sample_count": self.sample_count,
+        }
+
+
+class ResidualFitter:
+    """
+    Dimension-agnostic residual geometry engine.
+
+    - Inputs: `coords` with shape (N, D) and `values` with shape (N,)
+    - Feature map: callable that builds the regression design matrix from coords
+    - Outputs: a scattered `ResidualField` and a `ResidualGeometry` summary
+
+    Geometric interpretation:
+        ResidualField  → "where and how large are the deviations" (raw samples)
+        ResidualGeometry → "how much mass, where is its center, how well is the
+        baseline explaining the field" (no decisions, just shape descriptors)
+
+    Minimal usage:
+        >>> feature_map = lambda c: np.stack([np.ones(len(c)), c[:, 0], c[:, 0] ** 2], axis=1)
+        >>> fitter = ResidualFitter(feature_map)
+        >>> field, geom = fitter.fit(coords=np.arange(10).reshape(-1, 1), values=prices)
+
+    2D IV surface:
+        >>> def quad_surface(coords):
+        ...     m, t = coords[:, 0], coords[:, 1]
+        ...     return np.column_stack([np.ones_like(m), m, t, m**2, t**2, m * t])
+        >>> fitter = ResidualFitter(quad_surface)
+        >>> field, geom = fitter.fit(coords=iv_coords, values=iv_values)
+    """
+
+    def __init__(
+        self,
+        feature_map: Callable[[np.ndarray], np.ndarray],
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        self.feature_map = feature_map
+        self.timestamp = timestamp
+
+    def fit(self, coords: np.ndarray, values: np.ndarray) -> Tuple[ResidualField, ResidualGeometry]:
+        coords = np.asarray(coords, dtype=float)
+        values = np.asarray(values, dtype=float)
+
+        if coords.ndim != 2:
+            raise ValueError("coords must have shape (N, D)")
+        if values.ndim != 1:
+            raise ValueError("values must be a 1D array")
+        if coords.shape[0] != values.shape[0]:
+            raise ValueError("coords and values must have the same number of samples")
+
+        features = np.asarray(self.feature_map(coords), dtype=float)
+        if features.ndim != 2 or features.shape[0] != coords.shape[0]:
+            raise ValueError("feature_map must return array with shape (N, K)")
+
+        # Linear regression over feature space; feature_map controls basis.
+        model = LinearRegression(fit_intercept=False)
+        model.fit(features, values)
+        predictions = model.predict(features)
+        residuals = values - predictions
+
+        residual_energy = float(np.linalg.norm(residuals))
+        residual_max = float(np.max(np.abs(residuals))) if residuals.size else 0.0
+
+        weights = np.abs(residuals)
+        weight_sum = float(np.sum(weights))
+        # If residual energy is effectively zero, fall back to the mean location.
+        if weight_sum <= 1e-12:
+            centroid = np.mean(coords, axis=0)
+        else:
+            centroid = np.sum(coords * weights[:, None], axis=0) / weight_sum
+
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((values - np.mean(values)) ** 2))
+        fit_quality = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+        geometry = ResidualGeometry(
+            timestamp=self.timestamp or datetime.utcnow(),
+            domain_dim=coords.shape[1],
+            residual_energy=residual_energy,
+            residual_max=residual_max,
+            centroid=centroid,
+            fit_quality=fit_quality,
+            sample_count=len(values),
+        )
+
+        field = ResidualField(
+            coords=coords,
+            values=values,
+            predictions=predictions,
+            residuals=residuals,
+            coefficients=model.coef_,
+        )
+
+        return field, geometry
 
 
 def compute_residuals(
@@ -55,11 +191,20 @@ def compute_residuals(
     prices = df['price'].astype(float).values
     times = np.arange(len(prices)).reshape(-1, 1)
 
+    geometry = None
     # Fit least squares model
     try:
         fair_value, residual, normalized_residual, std_error, r_squared = (
             fit_least_squares(prices, times)
         )
+        # Geometry frame (1D time domain) for STRATA consumption.
+        try:
+            timestamp = pd.to_datetime(df.iloc[-1]["timestamp"]).to_pydatetime()
+            feature_map = lambda c: np.column_stack([np.ones(len(c)), c[:, 0]])
+            geometry = ResidualFitter(feature_map, timestamp=timestamp).fit(times, prices)[1]
+        except Exception as geo_exc:  # pragma: no cover - geometry emission is best-effort
+            logger.debug("Residual geometry emission skipped: %s", geo_exc)
+            geometry = None
     except Exception as e:
         logger.error(f"Error fitting least squares for {asset} {timescale}: {e}")
         return
@@ -79,6 +224,15 @@ def compute_residuals(
 
     write_residual_state(current_data)
 
+    # Emit geometry frame to STRATA buffer
+    if geometry is not None:
+        try:
+            from strata.state.strata_buffer import update_from_residual_geometry
+
+            update_from_residual_geometry(symbol=asset, geometry=geometry)
+        except Exception as exc:  # pragma: no cover - do not block residual persistence
+            logger.debug("Unable to update STRATA buffer with geometry: %s", exc)
+
     logger.info(
         f"Computed residual for {asset} {timescale}: "
         f"normalized_residual={normalized_residual:.4f}, "
@@ -96,28 +250,13 @@ def fit_least_squares(
     times: np.ndarray
 ) -> Tuple[float, float, float, float, float]:
     """
-    Fit linear regression model and calculate residuals.
+    Fit linear regression model and calculate residual geometry for 1D time.
 
-    The model fits a straight line through the price series:
-        fair_value(t) = slope * t + intercept
+    The feature map is a simple affine basis [1, t] so the baseline matches the
+    legacy time-trend fit while still flowing through the geometry engine.
 
-    Residuals are deviations from this line:
-        residual(t) = actual_price(t) - fair_value(t)
-
-    Args:
-        prices: Array of prices
-        times: Array of time indices
-
-    Returns:
-        Tuple of (fair_value, residual, normalized_residual, std_error, r_squared)
-        - fair_value: Predicted price from linear fit at current time
-        - residual: Actual price - fair_value
-        - normalized_residual: residual / std_error (dimensionless)
-        - std_error: Standard deviation of all residuals
-        - r_squared: Goodness of fit (0 to 1)
-
-    Raises:
-        ValueError: If inputs are invalid
+    Returns a tuple kept for backward compatibility with callers that expect:
+        (fair_value, residual, normalized_residual, std_error, r_squared)
     """
     if len(prices) < 2:
         raise ValueError("Need at least 2 data points for regression")
@@ -125,35 +264,25 @@ def fit_least_squares(
     if len(prices) != len(times):
         raise ValueError("prices and times must have same length")
 
-    # Fit model
-    model = LinearRegression()
-    model.fit(times, prices)
+    coords = np.asarray(times, dtype=float)
+    coords = coords.reshape(len(prices), -1)
+    prices_arr = np.asarray(prices, dtype=float)
 
-    # Predict fair value at current time (last point)
-    fair_value = model.predict(times[-1:].reshape(-1, 1))[0]
+    feature_map = lambda c: np.column_stack([np.ones(len(c)), c[:, 0]])
+    fitter = ResidualFitter(feature_map)
+    field, geometry = fitter.fit(coords=coords, values=prices_arr)
 
-    # Calculate residual at current time
-    residual = prices[-1] - fair_value
-
-    # Calculate standard error from all residuals
-    predictions = model.predict(times)
-    residuals_all = prices - predictions
-    std_error = np.std(residuals_all, ddof=1)  # Use sample std deviation
-
-    # Avoid division by zero
-    if std_error < 1e-10:
-        logger.warning("Standard error near zero, setting normalized_residual to 0")
-        normalized_residual = 0.0
-    else:
-        # Normalized residual (dimensionless z-score)
-        normalized_residual = residual / std_error
-
-    # R-squared (coefficient of determination)
-    r_squared = model.score(times, prices)
+    fair_value = float(field.predictions[-1])
+    residual = float(field.residuals[-1])
+    std_error = float(np.std(field.residuals, ddof=1)) if len(field.residuals) > 1 else 0.0
+    normalized_residual = residual / std_error if std_error > 1e-10 else 0.0
+    r_squared = float(geometry.fit_quality)
 
     logger.debug(
-        f"Least squares fit: slope={model.coef_[0]:.4f}, "
-        f"intercept={model.intercept_:.2f}, r_squared={r_squared:.4f}"
+        "Least squares fit (geom): slope=%.4f intercept=%.2f r_squared=%.4f",
+        field.coefficients[1] if len(field.coefficients) > 1 else 0.0,
+        field.coefficients[0] if len(field.coefficients) > 0 else 0.0,
+        r_squared,
     )
 
     return fair_value, residual, normalized_residual, std_error, r_squared
@@ -195,11 +324,18 @@ def compute_residuals_bulk(asset: str, timescale: str, n_periods: int) -> None:
 
         prices = window_df['price'].astype(float).values
         times = np.arange(len(prices)).reshape(-1, 1)
+        geometry = None
 
         try:
             fair_value, residual, normalized_residual, std_error, r_squared = (
                 fit_least_squares(prices, times)
             )
+            try:
+                timestamp = pd.to_datetime(window_df.iloc[-1]["timestamp"]).to_pydatetime()
+                feature_map = lambda c: np.column_stack([np.ones(len(c)), c[:, 0]])
+                geometry = ResidualFitter(feature_map, timestamp=timestamp).fit(times, prices)[1]
+            except Exception as geo_exc:  # pragma: no cover - best-effort geometry
+                logger.debug("Residual geometry emission skipped in bulk: %s", geo_exc)
 
             # Write to database
             current_data = {
@@ -215,6 +351,13 @@ def compute_residuals_bulk(asset: str, timescale: str, n_periods: int) -> None:
             }
 
             write_residual_state(current_data)
+            if geometry is not None:
+                try:
+                    from strata.state.strata_buffer import update_from_residual_geometry
+
+                    update_from_residual_geometry(symbol=asset, geometry=geometry)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Unable to update STRATA buffer with geometry (bulk): %s", exc)
             computed_count += 1
 
         except Exception as e:

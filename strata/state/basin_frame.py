@@ -1,20 +1,33 @@
-"""Interpreted STRATA basin snapshot."""
-from dataclasses import dataclass
+"""Geometry-only BasinFrame v0."""
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 
 @dataclass(frozen=True)
 class BasinFrame:
     """
-    Lightweight, JSON-friendly basin state.
+    Geometry-only frame describing residual field shape for STRATA v0.
 
-    All fields are numeric or list-of-numeric to keep serialization simple.
+    Basins are intentionally empty; this frame narrates geometry only.
     """
 
-    timestamp: float
-    basin_center: List[float]
-    basin_radius: Optional[float]
-    basin_velocity: Optional[float]
-    compression: Optional[float]
-    residual_norm: Optional[float]
+    timestamp: str  # ISO timestamp of the underlying residual geometry
+    symbol: str
+    domain_dim: int
+    residual_energy: float
+    residual_max: float
+    centroid: List[float]
+    fit_quality: float
+    basins: List[dict] = field(default_factory=list)
+
+    # Optional per-frame coordinates (do not alter legacy geometry fields).
+    residual_coordinate: Optional[float] = None
+    response: Optional[float] = None
+
+    # Legacy fields retained for compatibility with older tests/consumers.
+    basin_center: Optional[List[float]] = None
+    basin_radius: Optional[float] = None
+    basin_velocity: Optional[float] = None
+    compression: Optional[float] = None
+    residual_norm: Optional[float] = None
     stability_score: Optional[float] = None

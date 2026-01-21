@@ -14,12 +14,15 @@ from strata.analysis.position import calculate_position_state, compute_lag_score
 from strata.analysis.residuals import fit_least_squares
 from strata.config import BASIN_CLUSTERING_WINDOW, RESIDUAL_LOOKBACK_PERIODS
 from .basin_state import ResidualBasin
-from .state_buffer import BasinBuffer, StrataStateBuffer
+
+from .state_buffer import StrataBuffer, StrataStateBuffer
+
 from .state_frame import StateFrame, StateFrameBuffer
 from .strata_buffer import append_interpreted_state
 from .strata_state import StrataState
 
 logger = logging.getLogger(__name__)
+BasinBuffer = StrataBuffer  # legacy compatibility alias
 
 
 class StrataStateCommitter:
@@ -144,10 +147,36 @@ class StrataStateCommitter:
                 logger.warning("Price response missing price field: %s", data)
                 return None
             ts_raw = data.get("timestamp") or data.get("ts") or time.time()
-            return {
+            bid = data.get("bid")
+            if bid is None:
+                bid = data.get("best_bid")
+            ask = data.get("ask")
+            if ask is None:
+                ask = data.get("best_ask")
+            bid_size = data.get("bid_size")
+            if bid_size is None:
+                bid_size = data.get("best_bid_size")
+            ask_size = data.get("ask_size")
+            if ask_size is None:
+                ask_size = data.get("best_ask_size")
+
+            price_tick = {
                 "price": float(price),
                 "timestamp": self._to_timestamp(ts_raw),
             }
+            for key, value in (
+                ("bid", bid),
+                ("ask", ask),
+                ("bid_size", bid_size),
+                ("ask_size", ask_size),
+            ):
+                if value is None:
+                    continue
+                try:
+                    price_tick[key] = float(value)
+                except (TypeError, ValueError):
+                    logger.debug("Invalid %s value in price response: %s", key, value)
+            return price_tick
         except requests.RequestException as exc:
             logger.warning("Price poll failed for %s: %s", self.symbol, exc)
             return None
@@ -181,12 +210,14 @@ class StrataStateCommitter:
 
         surface_ts, atm_iv = self._extract_surface(surface_snapshot, price, surface_ts)
 
+        response = self._compute_response(price_tick)
         residual, normalized_residual = self._compute_residual(price, timestamp)
-        basin = self._compute_basin(normalized_residual)
+        basin, basin_is_2d = self._compute_basin(normalized_residual, response)
         basin_center = basin.center
         basin_width = basin.width
         basin_velocity = self._compute_basin_velocity(basin_center, timestamp)
         price_velocity = self._compute_price_velocity(normalized_residual, timestamp)
+        price_pressure = self._compute_price_pressure(price_tick)
 
         half_width = basin_width / 2.0 if basin_width is not None else 0.0
         distance_to_center = abs(normalized_residual - basin_center)
@@ -217,6 +248,9 @@ class StrataStateCommitter:
             price_velocity,
         )
 
+        # If 2D was not available, drop response so downstream stays in 1D.
+        response_for_state = response if basin_is_2d else None
+
         return StrataState(
             timestamp=timestamp,
             symbol=self.symbol,
@@ -231,7 +265,53 @@ class StrataStateCommitter:
             position_state=position_state,
             normalized_distance=normalized_distance,
             risk_score=risk_score,
+            price_pressure=price_pressure,
+            response=response_for_state,
         )
+
+    def _compute_response(self, price_tick: Dict[str, Any]) -> Optional[float]:
+        """
+        Canonical STRATA response metric: microprice - mid using top-of-book sizes.
+
+        Returns None when bid/ask or their sizes are missing or non-positive.
+        """
+
+        def _first_float(keys) -> Optional[float]:
+            for key in keys:
+                if key not in price_tick:
+                    continue
+                try:
+                    return float(price_tick[key])
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        bid = _first_float(("bid", "best_bid"))
+        ask = _first_float(("ask", "best_ask"))
+        bid_size = _first_float(("bid_size", "best_bid_size"))
+        ask_size = _first_float(("ask_size", "best_ask_size"))
+
+        if (
+            bid is None
+            or ask is None
+            or bid_size is None
+            or ask_size is None
+            or bid_size <= 0
+            or ask_size <= 0
+        ):
+            return None
+
+        microprice = (ask * bid_size + bid * ask_size) / (bid_size + ask_size)
+        mid_price = (bid + ask) / 2.0
+        return float(microprice - mid_price)
+
+    def _compute_price_pressure(self, price_tick: Dict[str, Any]) -> float:
+        """
+        Compute microprice-based price pressure. Falls back to 0.0 if book data is missing.
+        """
+
+        response = self._compute_response(price_tick)
+        return float(response) if response is not None else 0.0
 
     def _compute_residual(self, price: float, timestamp: float) -> Tuple[float, float]:
         prices, times = self._regression_window(price, timestamp)
@@ -267,9 +347,13 @@ class StrataStateCommitter:
 
         return prices, times
 
-    def _compute_basin(self, normalized_residual: float) -> ResidualBasin:
+    def _compute_basin(self, normalized_residual: float, response: Optional[float]) -> Tuple[ResidualBasin, bool]:
+        # Domain gating: prefer 2D basins when we have enough (residual, response) pairs;
+        # otherwise fall back to legacy 1D so publishing continues without fabricating response.
         residuals = [s.normalized_residual for s in self.buffer.history(BASIN_CLUSTERING_WINDOW - 1)]
         residuals.append(normalized_residual)
+        responses = [getattr(s, "response", None) for s in self.buffer.history(BASIN_CLUSTERING_WINDOW - 1)]
+        responses.append(response)
 
         if len(residuals) < 2:
             basin = ResidualBasin(
@@ -282,12 +366,28 @@ class StrataStateCommitter:
                 variance=0.0,
             )
             self.basin_buffer.push(basin)
-            return basin
+            return basin, False
 
         residual_array = np.array(residuals[-BASIN_CLUSTERING_WINDOW:], dtype=float)
+        coord_pairs = [
+            (r, resp)
+            for r, resp in zip(
+                residuals[-BASIN_CLUSTERING_WINDOW:],
+                responses[-BASIN_CLUSTERING_WINDOW:],
+            )
+            if resp is not None
+        ]
+        use_2d = len(coord_pairs) >= 2  # 2D only when we have enough (residual, response) points
+        use_1d = residual_array.size > 0  # Fallback: residual-only path stays active when response is absent
 
         try:
-            basin = cluster_residuals(residual_array)
+            if use_2d:
+                basin = cluster_residuals(np.array(coord_pairs, dtype=float))
+            elif use_1d:
+                # Explicit 1D fallback so we continue publishing scalar basins when response is unavailable.
+                basin = cluster_residuals(residual_array)
+            else:
+                raise ValueError("No residual samples available for basin computation")
         except Exception as exc:
             logger.debug("Basin clustering fallback for %s: %s", self.symbol, exc)
             center = float(np.mean(residual_array))
@@ -317,7 +417,7 @@ class StrataStateCommitter:
             )
 
         self.basin_buffer.push(basin)
-        return basin
+        return basin, use_2d
 
     def _compute_basin_velocity(self, center: float, timestamp: float) -> float:
         history = self.buffer.history(10)
@@ -464,6 +564,7 @@ class StrataStateCommitter:
             asset=self.symbol,
             timescale=self.frame_timescale,
             price=state.spot,
+            price_pressure=state.price_pressure,
             atm_iv=_as_float(state.atm_iv, 0.0) if state.atm_iv is not None else 0.0,
             iv_25d_call=_as_float(surface.get("iv_25d_call"), 0.0),
             iv_25d_put=_as_float(surface.get("iv_25d_put"), 0.0),
@@ -474,6 +575,7 @@ class StrataStateCommitter:
             gamma_exposure=_as_float(surface.get("gamma_exposure"), 0.0),
             vanna=_as_float(surface.get("vanna"), 0.0),
             vol_of_vol=_as_float(surface.get("vol_of_vol"), 0.0),
+            response=state.response,
         )
 
     @staticmethod

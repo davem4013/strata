@@ -22,3 +22,5 @@ class StrataState:
     position_state: str
     normalized_distance: float
     risk_score: float
+    price_pressure: float = 0.0
+    response: Optional[float] = None

@@ -42,3 +42,7 @@ class RegimeBuffer:
     @property
     def maxlen(self) -> int:
         return self._maxlen
+
+    def clear(self) -> None:
+        """Remove all stored regime states."""
+        self._buffer.clear()

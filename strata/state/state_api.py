@@ -11,8 +11,10 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from .state_buffer import StrataStateBuffer
+
 from . import strata_buffer as sb
 from .strata_buffer import BasinFrame
+from .basin_geometry import BasinGeometryFrame
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,18 @@ def get_basin_history(n: int = 100) -> List[BasinFrame]:
     if n <= 0:
         return []
     return sb.STRATA_BUFFER.history(n)
+
+
+def get_latest_basin_geometry() -> Optional[BasinGeometryFrame]:
+    """Return the most recent basin geometry frame (or None)."""
+    return sb.GEOMETRY_BUFFER.latest()
+
+
+def get_basin_geometry_history(n: int = 100) -> List[BasinGeometryFrame]:
+    """Return up to the last n geometry frames (oldest → newest)."""
+    if n <= 0:
+        return []
+    return sb.GEOMETRY_BUFFER.history(n)
 
 
 # -------------------------
@@ -102,3 +116,25 @@ def get_state_status(symbol: str = Query(..., description="Asset symbol")):
 def attach_to_app(app) -> None:
     """Include state routes on an existing FastAPI app."""
     app.include_router(router)
+
+
+# -------------------------
+# Geometry (canonical) routes
+# -------------------------
+@router.get("/state/strata/geometry/latest")
+def get_latest_geometry_frame():
+    """Return latest basin geometry frame (or null)."""
+    frame = get_latest_basin_geometry()
+    if frame is None:
+        raise HTTPException(status_code=404, detail="No geometry available")
+    return asdict(frame) if hasattr(frame, "__dataclass_fields__") else frame
+
+
+@router.get("/state/strata/geometry/history")
+def get_geometry_history(limit: int = Query(200, ge=1, le=5000)):
+    """Return up to n basin geometry frames (oldest→newest)."""
+    history = get_basin_geometry_history(limit)
+    frames: List[Dict] = []
+    for frame in history:
+        frames.append(asdict(frame) if hasattr(frame, "__dataclass_fields__") else frame)
+    return frames
