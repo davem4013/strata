@@ -1,16 +1,30 @@
 from strata.state.basin_frame import BasinFrame
+from strata.state.basin_state import ResidualBasin
 from strata.state.strata_buffer import StrataBuffer
 
 
 def _frame(ts: float, center: float) -> BasinFrame:
+    basin = ResidualBasin(
+        center=center,
+        width=1.0,
+        boundary_upper=center + 0.5,
+        boundary_lower=center - 0.5,
+        curvature=0.5,
+        sample_count=10,
+        variance=0.0,
+    ).to_dict()
+
     return BasinFrame(
-        timestamp=ts,
-        basin_center=[center],
-        basin_radius=1.0,
-        basin_velocity=0.1,
-        compression=0.2,
-        residual_norm=0.3,
-        stability_score=0.4,
+        timestamp=str(ts),
+        symbol="TEST",
+        domain_dim=1,
+        residual_energy=abs(center),
+        residual_max=abs(center),
+        centroid=[center],
+        fit_quality=1.0,
+        basins=[basin],
+        residual_coordinate=center,
+        response=None,
     )
 
 
@@ -50,5 +64,5 @@ def test_maxlen_eviction():
 
     hist = buf.history()
     assert len(hist) == 2
-    assert hist[0].timestamp == 2.0
-    assert hist[1].timestamp == 3.0
+    assert hist[0].timestamp == "2.0"
+    assert hist[1].timestamp == "3.0"

@@ -93,11 +93,12 @@ def test_committer_compute_basin_uses_objects_and_preserves_outputs(monkeypatch)
         surface_poll_seconds=0.1,
     )
 
-    basin = committer._compute_basin(0.3)
+    basin, basin_is_2d = committer._compute_basin(0.3, response=None)
 
     assert isinstance(basin, ResidualBasin)
     assert basin.center == target_basin.center
     assert basin.width == target_basin.width
+    assert basin_is_2d is False
 
     latest = committer.basin_buffer.latest()
     assert latest is basin
